@@ -1,0 +1,34 @@
+{
+  "ai": {
+    "provider": "mimo",
+    "deepseek": {
+      "api_key": "sk-your-deepseek-api-key"
+    },
+    "mimo": {
+      "api_key": "tp-your-mimo-token-plan-key",
+      "region": "cn"
+    }
+  },
+  "defaults": {
+    "version": "1.20.4",
+    "system_prompt": "你是一个在 Minecraft 服务器中的 AI 助手。回答简洁、友好，使用中文回复，尽量不超过 150 字。",
+    "trusted_players": [
+      "player1",
+      "player2"
+    ],
+    "queue_delay": 1500,
+    "max_msg_len": 40,
+    "auto_menu": true,
+    "auto_login": true
+  },
+  "bots": [
+    {
+      "name": "my_bot",
+      "host": "your-server.com",
+      "port": 25565,
+      "username": "my_bot_username",
+      "password": "my_bot_password",
+      "enabled": true
+    }
+  ]
+}
