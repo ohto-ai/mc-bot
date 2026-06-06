@@ -721,8 +721,7 @@ function createBotInstance(config, options = {}) {
             if (ctx.type === 'whisper' && ctx.isTrusted) {
                 executeRemoteCommand(ctx);
                 return;
-            }
-            if (ctx.type === 'whisper') {
+            } else if (ctx.type === 'whisper') {
                 ctx.reply(`[命令] 未知命令: ${content.split(' ')[0]}。输入 /help 查看帮助`);
             }
             return;
