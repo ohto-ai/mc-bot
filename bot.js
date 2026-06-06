@@ -149,6 +149,7 @@ function createBotInstance(config, options = {}) {
         max_msg_len: maxMsgLen,
         auto_menu: autoMenu,
         auto_login: autoLogin,
+        tp_reply: tpReply,
     } = config;
 
     // 持久化 trusted_players 的配置路径（由主入口传入）
@@ -559,6 +560,16 @@ function createBotInstance(config, options = {}) {
             const isTrusted = trustedPlayers.includes(sender.trim());
             const ctx = createMessageContext('whisper', TRIGGER.WHISPER, sender.trim(), msg.trim(), isTrusted);
             dispatchMessage(ctx);
+        }
+
+        // ========== 传送请求检测与私聊回复 ==========
+        const tpMatch = message.match(/(\S+)\s*请求(?:传送|你传送)到(?:你这里|他那里)/);
+        if (tpMatch && !isSelfEcho) {
+            const tpSender = tpMatch[1].trim();
+            if (tpReply) {
+                safeWhisper(tpSender, tpReply);
+                console.log(`${PREFIX} [传送] 检测到 ${tpSender} 的传送请求，已回复私聊`);
+            }
         }
 
         // 命令输出捕获

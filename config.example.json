@@ -19,7 +19,8 @@
     "queue_delay": 1500,
     "max_msg_len": 40,
     "auto_menu": true,
-    "auto_login": true
+    "auto_login": true,
+    "tp_reply": "收到你的传送请求~"
   },
   "bots": [
     {
