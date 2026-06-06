@@ -65,6 +65,15 @@ body {
     font-size: 1.3rem;
     font-weight: 600;
     color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.logo-icon {
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
 }
 
 .connection-status {

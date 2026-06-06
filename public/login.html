@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MC Bot 管理面板 — 登录</title>
+    <link rel="icon" type="image/svg+xml" href="/images/logo.svg">
     <link rel="stylesheet" href="/css/style.css">
     <style>
         .login-wrapper {
@@ -28,6 +29,15 @@
             font-weight: 700;
             margin-bottom: 4px;
             color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        .login-box h2 .logo-icon {
+            width: 32px;
+            height: 32px;
+            flex-shrink: 0;
         }
         .login-box .subtitle {
             text-align: center;
@@ -99,7 +109,7 @@
 <body>
     <div class="login-wrapper">
         <div class="login-box">
-            <h2>🟢 MC Bot 管理面板</h2>
+            <h2><img src="/images/logo.svg" alt="MC Bot" class="logo-icon"> MC Bot 管理面板</h2>
             <div class="subtitle">请输入用户名和密码登录</div>
             <form id="loginForm" autocomplete="off">
                 <div class="form-group">

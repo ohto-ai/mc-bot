@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Creeper face logo for MC Bot -->
+  <!-- Background rounded square -->
+  <rect x="2" y="2" width="60" height="60" rx="12" ry="12" fill="#5cb85c" />
+
+  <!-- Eyes - two black squares -->
+  <rect x="12" y="16" width="12" height="12" rx="1" fill="#1a1a2e" />
+  <rect x="40" y="16" width="12" height="12" rx="1" fill="#1a1a2e" />
+
+  <!-- Nose - centered -->
+  <rect x="26" y="28" width="12" height="8" rx="1" fill="#1a1a2e" />
+
+  <!-- Mouth - pixel art style -->
+  <rect x="12" y="40" width="8" height="8" rx="1" fill="#1a1a2e" />
+  <rect x="24" y="40" width="8" height="8" rx="1" fill="#1a1a2e" />
+  <rect x="36" y="40" width="8" height="8" rx="1" fill="#1a1a2e" />
+  <rect x="48" y="40" width="8" height="8" rx="1" fill="#1a1a2e" />
+
+  <!-- Mouth side extensions -->
+  <rect x="8" y="48" width="8" height="6" rx="1" fill="#1a1a2e" />
+  <rect x="20" y="48" width="8" height="6" rx="1" fill="#1a1a2e" />
+  <rect x="32" y="48" width="8" height="6" rx="1" fill="#1a1a2e" />
+  <rect x="44" y="48" width="8" height="6" rx="1" fill="#1a1a2e" />
+</svg>
