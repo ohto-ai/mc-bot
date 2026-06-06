@@ -308,10 +308,7 @@ function createBotInstance(config, options = {}) {
     }
 
     function extractQQPrompt(qqMsg, targetBotName) {
-        let match = qqMsg.match(/ai[:：]\s*(.+)/);
-        if (match && match[1].trim()) return match[1].trim();
-
-        match = qqMsg.match(new RegExp(`@${escapeRegex(targetBotName)}\\s*(.+)$`));
+        let match = qqMsg.match(new RegExp(`@${escapeRegex(targetBotName)}\\s*(.+)$`));
         if (match && match[1].trim()) return match[1].trim();
         if (new RegExp(`@${escapeRegex(targetBotName)}`).test(qqMsg)) {
             return qqMsg.replace(new RegExp(`@${escapeRegex(targetBotName)}\\s*`, 'g'), '').trim();
@@ -663,11 +660,7 @@ function createBotInstance(config, options = {}) {
     // ========== AI 对话处理 ==========
 
     async function handleAIChat(ctx) {
-        // 剥离 ai: / ai：前缀（向后兼容）
-        let prompt = ctx.content.trim();
-        if (/^ai[：:]\s*/i.test(prompt)) {
-            prompt = prompt.replace(/^ai[：:]\s*/i, '');
-        }
+        const prompt = ctx.content.trim();
         if (!prompt) return;
 
         console.log(`${PREFIX} [AI-${aiProvider}] ${ctx.sender} (${ctx.type}): ${prompt}`);
@@ -756,7 +749,7 @@ function createBotInstance(config, options = {}) {
         (ctx) => { ctx.reply('pong!'); });
 
     cmd('/v50', ['/v50', 'v50'],
-        TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY,
+        TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.ALL,
         '/v50 — 疯狂星期四文案',
         async (ctx) => {
@@ -774,7 +767,7 @@ function createBotInstance(config, options = {}) {
     // ---- 帮助（自动生成） ----
 
     cmd('/help', ['/help'],
-        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY,
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/help — 显示此帮助',
         (ctx) => {
@@ -1154,21 +1147,30 @@ function createBotInstance(config, options = {}) {
             if (!targetUser) { ctx.reply('[Bot管理] 用法: /bot kill <用户名>'); return; }
             const lowerTarget = targetUser.toLowerCase();
 
-            if (lowerTarget === bot.username.toLowerCase()) {
-                ctx.reply('[Bot管理] 不能通过 /bot kill 下线自己，请从其他机器人操作');
-                return;
-            }
-
             if (!botRegistry || !botRegistry.has(lowerTarget)) {
                 ctx.reply(`[Bot管理] 机器人 ${targetUser} 未在运行`);
                 return;
             }
 
+            const isSelf = lowerTarget === bot.username.toLowerCase();
             const targetBot = botRegistry.get(lowerTarget);
-            try { targetBot.end(); } catch (e) {}
-            botRegistry.delete(lowerTarget);
-            ctx.reply(`[Bot管理] 机器人 ${targetUser} 已下线`);
-            console.log(`${PREFIX} [Bot管理] ${ctx.sender} 将机器人 ${targetUser} 下线`);
+
+            if (isSelf) {
+                // 自 kill：先发告别消息，再下线
+                console.log(`${PREFIX} [Bot管理] ${ctx.sender} 命令我下线`);
+                bot.chat(`§e[${bot.username}] 收到 ${ctx.sender} 的指令，正在下线... 再见！`);
+                bot.whisper(ctx.sender, `[Bot管理] 正在下线...`);
+                // 给消息一点时间发出
+                setTimeout(() => {
+                    try { targetBot.end(); } catch (e) {}
+                    botRegistry.delete(lowerTarget);
+                }, 500);
+            } else {
+                try { targetBot.end(); } catch (e) {}
+                botRegistry.delete(lowerTarget);
+                ctx.reply(`[Bot管理] 机器人 ${targetUser} 已下线`);
+                console.log(`${PREFIX} [Bot管理] ${ctx.sender} 将机器人 ${targetUser} 下线`);
+            }
         });
 
     cmd('/bot spawn', ['/bot spawn'],
