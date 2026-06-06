@@ -84,15 +84,15 @@ function getAIConfig(config) {
     };
 }
 
+// ========== Bot 管理状态 ==========
+const config = loadConfig();
+
 // ========== Express 服务器 ==========
 const app = express();
-const PORT = process.env.WEB_PORT || 3000;
+const PORT = process.env.WEB_PORT || config.web_port || 3000;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
-
-// ========== Bot 管理状态 ==========
-const config = loadConfig();
 const defaults = config.defaults || {};
 const aiCfg = getAIConfig(config);
 const botRegistry = new Map();
