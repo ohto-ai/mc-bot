@@ -144,6 +144,15 @@ body {
 .btn-sm { padding: 5px 12px; font-size: 0.8rem; }
 .btn-xs { padding: 3px 8px; font-size: 0.75rem; }
 
+.btn-logout {
+    color: var(--danger) !important;
+    border-color: var(--danger) !important;
+}
+
+.btn-logout:hover {
+    background: var(--danger-bg) !important;
+}
+
 .btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;

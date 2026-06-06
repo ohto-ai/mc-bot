@@ -2,6 +2,25 @@
  *  MC Bot Web 管理面板 — 前端逻辑
  * ================================================================ */
 
+// ========== 鉴权 ==========
+function getToken() {
+    return localStorage.getItem('mc_bot_token') || '';
+}
+
+function isAuthenticated() {
+    return !!getToken();
+}
+
+function logout() {
+    fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + getToken() },
+    }).finally(() => {
+        localStorage.removeItem('mc_bot_token');
+        window.location.replace('/login.html');
+    });
+}
+
 // ========== 状态 ==========
 let botsData = [];
 let currentModalBot = null;
@@ -20,6 +39,11 @@ const cmdModal = $('#cmdModal');
 
 // ========== 初始化 ==========
 document.addEventListener('DOMContentLoaded', () => {
+    // 未登录则跳转
+    if (!isAuthenticated()) {
+        window.location.replace('/login.html');
+        return;
+    }
     fetchBots();
     fetchLogs();
     connectSSE();
@@ -51,6 +75,11 @@ function bindEvents() {
         if (e.target === cmdModal) closeCmdModal();
     });
 
+    // 退出登录
+    $('#logoutBtn').addEventListener('click', () => {
+        if (confirm('确定要退出登录吗？')) logout();
+    });
+
     // ESC 关闭弹窗
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') closeCmdModal();
@@ -67,7 +96,7 @@ function bindEvents() {
 
 // ========== SSE 连接 ==========
 function connectSSE() {
-    const es = new EventSource('/api/events');
+    const es = new EventSource(`/api/events?token=${encodeURIComponent(getToken())}`);
 
     es.addEventListener('status', (e) => {
         try {
@@ -104,8 +133,7 @@ function connectSSE() {
 // ========== API 调用 ==========
 async function fetchBots() {
     try {
-        const res = await fetch('/api/bots');
-        botsData = await res.json();
+        botsData = await apiCall('GET', '/api/bots');
         renderBots();
     } catch (err) {
         console.error('获取 bot 列表失败:', err);
@@ -116,8 +144,7 @@ async function fetchLogs() {
     try {
         const source = logFilter.value;
         const url = source ? `/api/logs?source=${encodeURIComponent(source)}` : '/api/logs';
-        const res = await fetch(url);
-        const logs = await res.json();
+        const logs = await apiCall('GET', url);
         logContainer._allLogs = logs;
         renderLogs(logs);
     } catch (err) {
@@ -126,9 +153,22 @@ async function fetchLogs() {
 }
 
 async function apiCall(method, url, body) {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    const token = getToken();
+    const opts = {
+        method,
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token,
+        },
+    };
     if (body) opts.body = JSON.stringify(body);
     const res = await fetch(url, opts);
+    if (res.status === 401) {
+        // Token 过期或无效，跳转登录页
+        localStorage.removeItem('mc_bot_token');
+        window.location.replace('/login.html');
+        return { error: '未登录' };
+    }
     return res.json();
 }
 

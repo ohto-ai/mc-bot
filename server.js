@@ -1,6 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const jwt = require('jsonwebtoken');
 const { createBotInstance } = require('./bot');
 
 // ========== 配置加载 ==========
@@ -87,12 +88,132 @@ function getAIConfig(config) {
 // ========== Bot 管理状态 ==========
 const config = loadConfig();
 
+// ========== Web 鉴权配置 ==========
+function getWebAuthConfig() {
+    const cfg = config.web_auth || {};
+    return {
+        username: cfg.username || 'admin',
+        password: cfg.password || 'admin',
+        jwtSecret: cfg.jwt_secret || 'mc_bot_default_jwt_secret_change_me',
+    };
+}
+
+// ========== JWT 工具函数 ==========
+function parseCookies(req) {
+    const header = req.headers.cookie;
+    if (!header) return {};
+    const cookies = {};
+    header.split(';').forEach(c => {
+        const idx = c.indexOf('=');
+        if (idx > 0) {
+            cookies[c.slice(0, idx).trim()] = decodeURIComponent(c.slice(idx + 1).trim());
+        }
+    });
+    return cookies;
+}
+
+function getToken(req) {
+    // 1. Authorization: Bearer <token>
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        return authHeader.slice(7);
+    }
+    // 2. Query parameter（SSE 回退用）
+    if (req.query && req.query.token) {
+        return req.query.token;
+    }
+    // 3. Cookie
+    const cookies = parseCookies(req);
+    return cookies.mc_bot_token || null;
+}
+
+function verifyToken(token) {
+    if (!token) return null;
+    try {
+        return jwt.verify(token, getWebAuthConfig().jwtSecret);
+    } catch (e) {
+        return null;
+    }
+}
+
 // ========== Express 服务器 ==========
 const app = express();
 const PORT = process.env.WEB_PORT || config.web_port || 3000;
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+
+// ========== 鉴权 API（无需登录） ==========
+
+app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body || {};
+    const authCfg = getWebAuthConfig();
+
+    if (!username || !password) {
+        return res.status(400).json({ error: '请输入用户名和密码' });
+    }
+
+    if (username !== authCfg.username || password !== authCfg.password) {
+        return res.status(401).json({ error: '用户名或密码错误' });
+    }
+
+    const token = jwt.sign(
+        { username, loginAt: Date.now() },
+        authCfg.jwtSecret,
+        { expiresIn: '24h' }
+    );
+
+    res.cookie('mc_bot_token', token, {
+        httpOnly: true,
+        maxAge: 24 * 60 * 60 * 1000,
+        sameSite: 'strict',
+    });
+
+    res.json({ success: true, token, username });
+});
+
+app.get('/api/auth/status', (req, res) => {
+    const token = getToken(req);
+    const decoded = verifyToken(token);
+    if (decoded) {
+        res.json({ authenticated: true, username: decoded.username });
+    } else {
+        res.json({ authenticated: false });
+    }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    res.clearCookie('mc_bot_token');
+    res.json({ success: true });
+});
+
+// ========== API 鉴权中间件（所有 /api/* 除 /api/auth/* 需登录） ==========
+app.use('/api', (req, res, next) => {
+    if (req.path.startsWith('/auth/')) return next();
+    const token = getToken(req);
+    if (!verifyToken(token)) {
+        return res.status(401).json({ error: '未登录或登录已过期' });
+    }
+    next();
+});
+
+// ========== 页面访问鉴权（跳转登录页） ==========
+app.use((req, res, next) => {
+    const p = req.path;
+    // 不拦截 API 请求
+    if (p.startsWith('/api/')) return next();
+    // 允许登录页及共享资源
+    if (p === '/login.html' || p.startsWith('/css/') || p.startsWith('/js/')) return next();
+    // 对根路径和 HTML 页面检查登录
+    if (req.method === 'GET' && (p === '/' || p === '/index.html' || !p.includes('.'))) {
+        const token = getToken(req);
+        if (!verifyToken(token)) {
+            return res.redirect('/login.html');
+        }
+    }
+    next();
+});
+
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 const defaults = config.defaults || {};
 const aiCfg = getAIConfig(config);
 const botRegistry = new Map();
@@ -358,11 +479,14 @@ app.get('/api/events', (req, res) => {
     });
 });
 
-// SPA fallback — 非 API/静态文件请求返回 index.html
+// SPA fallback — 非 API/静态文件请求返回 index.html（需登录）
 app.use((req, res, next) => {
     if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Not found' });
-    // 静态文件已经由 express.static 处理，剩下的交给 index.html
     if (req.method === 'GET' && !req.path.includes('.')) {
+        const token = getToken(req);
+        if (!verifyToken(token)) {
+            return res.redirect('/login.html');
+        }
         return res.sendFile(path.join(__dirname, 'public', 'index.html'));
     }
     next();
