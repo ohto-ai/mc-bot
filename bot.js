@@ -191,10 +191,8 @@ function createBotInstance(config, options = {}) {
 
     // ---- 调试日志：监听所有关键事件 ----
     const events = [
-        'chat', 'whisper', 'windowOpen',
-        'message',
+        'whisper', 'windowOpen',
         'login', 'connect', 'end', 'error', 'kicked',
-        'health',
         'death', 'respawn',
         'rain',
     ];
@@ -535,7 +533,7 @@ function createBotInstance(config, options = {}) {
             console.log(`${PREFIX} [服务器] ${message}`);
         }
 
-        // QQ群消息AI回复
+        // QQ群消息 — 通过 dispatch 分发（支持命令与 AI 对话）
         const qqGroupMatch = message.match(/^【QQ群消息】(.+?)\s*\((.+?)\)\s*:\s*(.+)$/);
         if (qqGroupMatch && !isSelfEcho) {
             const qqSender = qqGroupMatch[1].trim();
@@ -545,16 +543,15 @@ function createBotInstance(config, options = {}) {
             if (qqSender.toLowerCase() !== bot.username.toLowerCase()) {
                 const triggerPrompt = extractQQPrompt(qqMsg, bot.username);
                 if (triggerPrompt) {
-                    console.log(`${PREFIX} [AI-QQ] ${qqDisplayName}(${qqSender}) 群聊提问: ${triggerPrompt}`);
-                    queryAI(triggerPrompt).then(reply => {
-                        console.log(`${PREFIX} [AI-QQ] 回复: ${reply}`);
-                        sendQQReply(reply);
-                    });
+                    const isTrusted = trustedPlayers.includes(qqSender);
+                    const ctx = createMessageContext('qq_at', TRIGGER.QQ_AT, qqSender, triggerPrompt, isTrusted);
+                    console.log(`${PREFIX} [QQ] ${qqDisplayName}(${qqSender}): ${triggerPrompt}`);
+                    dispatchMessage(ctx);
                 }
             }
         }
 
-        // 私聊兜底检测
+        // 私聊兜底检测 — 通过 dispatch 分发
         let whisperMatch = message.match(/\[(.+?)\s*(?:->|→)\s*我\]\s*(.+)/);
         if (!whisperMatch) {
             whisperMatch = message.match(/(\S+)\s+(?:悄悄地对你说|→ 你|私聊)[：:]\s*(.+)/);
@@ -562,7 +559,9 @@ function createBotInstance(config, options = {}) {
         if (whisperMatch && !isSelfEcho) {
             const [_, sender, msg] = whisperMatch;
             console.log(`${PREFIX} [私聊-兜底] ${sender}: ${msg}`);
-            handleWhisper(sender.trim(), msg.trim());
+            const isTrusted = trustedPlayers.includes(sender.trim());
+            const ctx = createMessageContext('whisper', TRIGGER.WHISPER, sender.trim(), msg.trim(), isTrusted);
+            dispatchMessage(ctx);
         }
 
         // 命令输出捕获
@@ -603,102 +602,412 @@ function createBotInstance(config, options = {}) {
         }
     });
 
-    // ========== 公聊事件 ==========
-    bot.on('chat', (username, message) => {
-        if (message === 'ping') safeChat('pong!');
+    // ========== 命令注册系统 ==========
 
-        if (message === 'v50') {
-            fetch('https://api.shadiao.pro/kfc')
-                .then(res => res.json())
-                .then(data => {
-                    const text = data?.data?.text;
-                    if (text) {
-                        let safeText = text.replace(/\r?\n/g, ' ').trim();
-                        safeChat(`[疯狂星期四] ${text}`);
-                    } else {
-                        safeChat('今天不是疯狂星期四，但你可以 V 我 50！');
+    // 触发条件（位掩码，可用 | 组合）
+    const TRIGGER = {
+        CHAT:    1 << 0,  // 公聊直接发送（无 @/>> 前缀，不带 /，因为 / 会被客户端拦截）
+        WHISPER: 1 << 1,  // 私聊
+        MENTION: 1 << 2,  // 公聊 @botname
+        REPLY:   1 << 3,  // 公聊 >>botname
+        QQ_AT:   1 << 4,  // QQ群 @botname
+    };
+
+    const TARGET = {
+        ALL:     'all',
+        TRUSTED: 'trusted',
+    };
+
+    const commandRegistry = [];
+
+    // 注册命令：cmd(名称, 匹配前缀数组, 触发条件, 触发对象, 帮助文本, 处理函数)
+    // handler 签名: async (ctx, args) — ctx 为消息上下文，args 为命令参数
+    function cmd(name, patterns, triggers, target, help, handler) {
+        commandRegistry.push({ name, patterns, triggers, target, help, handler });
+    }
+
+    // 查找匹配的命令（最长前缀匹配，确保 /trust add 优先于 /trust）
+    function findCommand(content) {
+        let best = null, bestLen = 0;
+        for (const def of commandRegistry) {
+            for (const pat of def.patterns) {
+                if (content === pat || content.startsWith(pat + ' ')) {
+                    if (pat.length > bestLen) {
+                        best = { def, args: content === pat ? '' : content.slice(pat.length + 1).trim() };
+                        bestLen = pat.length;
                     }
-                })
-                .catch(err => {
-                    console.error(`${PREFIX} KFC API 请求失败:`, err);
-                    safeChat('疯狂星期四文案获取失败，但 V 我 50 的心是真的！');
-                });
-        }
-
-        // AI 对话：以 ai: 开头的公聊消息
-        if (message.startsWith('ai:') || message.startsWith('ai：')) {
-            const prompt = message.slice(3).trim();
-            if (prompt) {
-                console.log(`${PREFIX} [AI-${aiProvider}] ${username} 公聊提问: ${prompt}`);
-                queryAI(prompt).then(reply => {
-                    safeChat(`[AI] ${reply}`);
-                });
-            }
-        }
-
-        // @提及 / >> 指向机器人（动态匹配 bot.username）
-        const mentionPrefixes = [`>>${bot.username}`, `@${bot.username}`];
-        for (const prefix of mentionPrefixes) {
-            if (message.startsWith(prefix)) {
-                const prompt = message.slice(prefix.length).trim();
-                if (prompt) {
-                    console.log(`${PREFIX} [AI-${aiProvider}] ${username} 公聊提及: ${prompt}`);
-                    queryAI(prompt).then(reply => {
-                        safeChat(`[AI] ${reply}`);
-                    });
                 }
-                break;
             }
         }
-    });
+        return best;
+    }
 
-    // ========== 统一私聊处理 ==========
-    async function handleWhisper(username, message) {
-        console.log(`${PREFIX} [私聊] ${username}: ${message}`);
+    // ========== 消息上下文 ==========
 
-        if (message === 'ping') {
-            safeWhisper(username, 'pong!');
-            return;
+    function createMessageContext(type, triggerFlag, sender, content, isTrusted) {
+        return {
+            type,          // 'chat' | 'whisper' | 'mention' | 'reply' | 'qq_at'
+            triggerFlag,   // 匹配的 TRIGGER 位
+            sender,        // 发送者用户名
+            content,       // 清洗后的消息内容（不含 @botname / >>botname 等前缀）
+            isTrusted,     // 是否为可信玩家
+            // 根据消息类型原路返回
+            reply(text) {
+                if (type === 'whisper') safeWhisper(sender, text);
+                else if (type === 'qq_at') sendQQReply(text);
+                else safeChat(text); // chat / mention / reply → 公聊
+            },
+        };
+    }
+
+    // ========== AI 对话处理 ==========
+
+    async function handleAIChat(ctx) {
+        // 剥离 ai: / ai：前缀（向后兼容）
+        let prompt = ctx.content.trim();
+        if (/^ai[：:]\s*/i.test(prompt)) {
+            prompt = prompt.replace(/^ai[：:]\s*/i, '');
         }
+        if (!prompt) return;
 
-        // AI 对话
-        if (message.startsWith('ai:') || message.startsWith('ai：')) {
-            const prompt = message.slice(3).trim();
-            if (prompt) {
-                console.log(`${PREFIX} [AI-${aiProvider}] ${username} 私聊提问: ${prompt}`);
-                const reply = await queryAI(prompt);
-                safeWhisper(username, `[AI] ${reply}`);
+        console.log(`${PREFIX} [AI-${aiProvider}] ${ctx.sender} (${ctx.type}): ${prompt}`);
+        const reply = await queryAI(prompt);
+        console.log(`${PREFIX} [AI-${aiProvider}] 回复: ${reply}`);
+        ctx.reply(`[AI] ${reply}`);
+    }
+
+    // ========== 远程命令转发（兜底） ==========
+
+    function executeRemoteCommand(ctx) {
+        console.log(`${PREFIX} [命令] ${ctx.sender} 执行: ${ctx.content}`);
+        cmdCapture = {
+            target: ctx.sender,
+            messages: [],
+            timer: setTimeout(flushCmdCapture, 1500),
+        };
+        safeChat(ctx.content);
+    }
+
+    // ========== 命令分发 ==========
+
+    async function dispatchMessage(ctx) {
+        const content = ctx.content.trim();
+
+        // 尝试匹配已注册命令（支持 /xxx 和纯文本如 ping、v50）
+        const match = findCommand(content);
+        if (match) {
+            const { def, args } = match;
+
+            // 检查触发条件（位掩码匹配）
+            if (!(def.triggers & ctx.triggerFlag)) {
+                if (ctx.type === 'whisper') {
+                    ctx.reply(`[命令] ${def.name} 不支持在此方式下使用`);
+                }
+                return;
+            }
+
+            // 检查触发对象
+            if (def.target === TARGET.TRUSTED && !ctx.isTrusted) {
+                ctx.reply('[权限] 你没有权限使用此命令');
+                return;
+            }
+
+            // 执行命令
+            try {
+                console.log(`${PREFIX} [命令] ${ctx.sender} → ${def.name} ${args || ''}`);
+                await def.handler(ctx, args);
+            } catch (err) {
+                console.error(`${PREFIX} [命令错误] ${def.name}:`, err.message);
+                ctx.reply(`[错误] 命令执行失败: ${err.message}`);
             }
             return;
         }
 
-        // 手动触发菜单
-        if (message === 'menu' && trustedPlayers.includes(username)) {
-            menuDone = false;
-            safeChat('/menu');
-            safeWhisper(username, '已发送 /menu');
+        // 未匹配的 / 命令：仅私聊可信玩家 → 远程命令转发（兜底）
+        if (content.startsWith('/')) {
+            if (ctx.type === 'whisper' && ctx.isTrusted) {
+                executeRemoteCommand(ctx);
+                return;
+            }
+            if (ctx.type === 'whisper') {
+                ctx.reply(`[命令] 未知命令: ${content.split(' ')[0]}。输入 /help 查看帮助`);
+            }
             return;
         }
 
-        // 交互式菜单搜索
-        if (message.startsWith('/menu ') && trustedPlayers.includes(username)) {
-            const keyword = message.slice(6).trim();
-            console.log(`${PREFIX} [搜索] ${username} 搜索菜单: "${keyword}"`);
-            clearPendingConfirm();
-            menuSearch = { player: username, keyword };
-            safeChat('/menu');
-            return;
-        }
+        // 无 / 的非命令消息 → AI 对话
+        // 公聊无提及的消息不触发 AI（避免噪声）
+        if (ctx.type === 'chat') return;
 
-        // 确认点击
-        if (message === '/confirm' && trustedPlayers.includes(username)) {
-            if (!pendingConfirm || pendingConfirm.player !== username) {
-                safeWhisper(username, '[搜索] 没有待确认的操作');
+        // 私聊 / @提及 / >>回复 / QQ群@ → 一律进入 AI 对话
+        await handleAIChat(ctx);
+    }
+
+    // ================================================================
+    //  命令定义（按类别分组）
+    // ================================================================
+
+    // ---- 公共命令（所有人可用） ----
+
+    cmd('/ping', ['/ping', 'ping'],
+        TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/ping — 测试机器人是否在线',
+        (ctx) => { ctx.reply('pong!'); });
+
+    cmd('/v50', ['/v50', 'v50'],
+        TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY,
+        TARGET.ALL,
+        '/v50 — 疯狂星期四文案',
+        async (ctx) => {
+            try {
+                const res = await fetch('https://api.shadiao.pro/kfc');
+                const data = await res.json();
+                const text = data?.data?.text;
+                ctx.reply(text ? `[疯狂星期四] ${text.replace(/\r?\n/g, ' ').trim()}` : '今天不是疯狂星期四，但你可以 V 我 50！');
+            } catch (err) {
+                console.error(`${PREFIX} KFC API 请求失败:`, err);
+                ctx.reply('疯狂星期四文案获取失败，但 V 我 50 的心是真的！');
+            }
+        });
+
+    // ---- 帮助（自动生成） ----
+
+    cmd('/help', ['/help'],
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY,
+        TARGET.TRUSTED,
+        '/help — 显示此帮助',
+        (ctx) => {
+            const lines = [`[帮助] 可用指令 (${commandRegistry.length} 个):`];
+            for (const c of commandRegistry) {
+                if (c.help) lines.push(c.help);
+            }
+            ctx.reply(lines.join('\n'));
+        });
+
+    // ---- 物品栏 / 快捷栏 ----
+
+    cmd('/inv', ['/inv', '/inventory'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/inv — 查看物品栏',
+        (ctx) => {
+            const items = bot.inventory.items();
+            if (items.length === 0) { ctx.reply('[物品栏] 物品栏为空'); return; }
+            const hotbarSlot = bot.quickBarSlot;
+            const lines = items.map(item => {
+                const name = formatItemName(item);
+                const slot = item.slot;
+                const isHotbar = slot >= 36 && slot <= 44;
+                const marker = isHotbar ? (slot - 36 === hotbarSlot ? ' [当前手持]' : ' [快捷栏]') : '';
+                return `栏${slot} ${name} x${item.count}${marker}`;
+            });
+            ctx.reply(`[物品栏] 共 ${items.length} 种物品:\n${lines.join('\n')}`);
+        });
+
+    cmd('/hotbar', ['/hotbar'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/hotbar <1-9> — 切换快捷栏',
+        (ctx, args) => {
+            const slot = parseInt(args);
+            if (isNaN(slot) || slot < 1 || slot > 9) { ctx.reply('[切换] 用法: /hotbar <1-9>'); return; }
+            bot.setQuickBarSlot(slot - 1);
+            ctx.reply(`[切换] 已切换到快捷栏 ${slot}: ${formatItemName(bot.heldItem)}`);
+        });
+
+    // ---- 物品操作 ----
+
+    cmd('/drop', ['/drop'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/drop <物品名> [数量] — 丢弃物品',
+        async (ctx, args) => {
+            const parts = args.split(' ');
+            const countStr = parts[parts.length - 1];
+            const isCount = /^\d+$/.test(countStr);
+            const count = isCount ? parseInt(countStr) : 1;
+            const nameParts = isCount ? parts.slice(0, -1) : parts;
+            const itemName = nameParts.join(' ').toLowerCase();
+
+            const item = bot.inventory.items().find(it =>
+                it.name?.toLowerCase().includes(itemName) ||
+                formatItemName(it).toLowerCase().includes(itemName)
+            );
+            if (!item) { ctx.reply(`[丢弃] 物品栏中没有找到 "${nameParts.join(' ')}"`); return; }
+            try {
+                await bot.toss(item.type, null, Math.min(count, item.count));
+                ctx.reply(`[丢弃] 已丢弃 ${formatItemName(item)} x${Math.min(count, item.count)}`);
+            } catch (err) {
+                ctx.reply(`[丢弃] 失败: ${err.message}`);
+            }
+        });
+
+    cmd('/dropstack', ['/dropstack'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/dropstack — 丢弃手中整组物品',
+        async (ctx) => {
+            if (!bot.heldItem) { ctx.reply('[丢弃] 手中没有物品'); return; }
+            try {
+                const itemName = formatItemName(bot.heldItem);
+                await bot.tossStack(bot.heldItem);
+                ctx.reply(`[丢弃] 已丢弃整组: ${itemName}`);
+            } catch (err) {
+                ctx.reply(`[丢弃] 失败: ${err.message}`);
+            }
+        });
+
+    cmd('/equip', ['/equip'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/equip <物品名> — 装备物品到手中',
+        async (ctx, args) => {
+            const equipName = args.toLowerCase();
+            const item = bot.inventory.items().find(it =>
+                it.name?.toLowerCase().includes(equipName) ||
+                formatItemName(it).toLowerCase().includes(equipName)
+            );
+            if (!item) { ctx.reply(`[装备] 物品栏中没有找到 "${args}"`); return; }
+            try {
+                await bot.equip(item, 'hand');
+                ctx.reply(`[装备] 已装备: ${formatItemName(item)}`);
+            } catch (err) {
+                ctx.reply(`[装备] 失败: ${err.message}`);
+            }
+        });
+
+    // ---- 攻击 ----
+
+    cmd('/attack', ['/attack'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/attack [实体名] — 攻击最近实体（不填则攻击敌对生物）',
+        (ctx, args) => {
+            let target;
+            if (args) {
+                const targetName = args.toLowerCase();
+                target = bot.nearestEntity(e => e.name && e.name.toLowerCase().includes(targetName));
+                if (!target) { ctx.reply(`[攻击] 附近没有找到 "${args}"`); return; }
+            } else {
+                target = bot.nearestEntity(e => e.kind === 'hostile');
+                if (!target) { ctx.reply('[攻击] 附近没有敌对生物'); return; }
+            }
+            try {
+                bot.attack(target);
+                ctx.reply(`[攻击] 正在攻击: ${target.displayName || target.name}${target.username ? ' (' + target.username + ')' : ''}`);
+            } catch (err) {
+                ctx.reply(`[攻击] 失败: ${err.message}`);
+            }
+        });
+
+    // ---- 物品使用 ----
+
+    cmd('/use', ['/use'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/use — 使用手中物品（单次）',
+        (ctx) => {
+            if (!bot.heldItem) { ctx.reply('[使用] 手中没有物品'); return; }
+            bot.activateItem();
+            setTimeout(() => { if (bot.usingHeldItem) bot.deactivateItem(); }, 100);
+            ctx.reply(`[使用] 已使用: ${formatItemName(bot.heldItem)}`);
+        });
+
+    cmd('/use hold', ['/use hold'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/use hold — 开始持续右键',
+        (ctx) => {
+            if (bot.activateItemInterval) clearInterval(bot.activateItemInterval);
+            bot.activateItemInterval = setInterval(() => bot.activateItem(), 50);
+            ctx.reply('[使用] 已开始持续右键');
+        });
+
+    cmd('/use stop', ['/use stop'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/use stop — 停止持续右键',
+        (ctx) => {
+            if (bot.activateItemInterval) {
+                clearInterval(bot.activateItemInterval);
+                bot.activateItemInterval = null;
+                ctx.reply('[使用] 已停止持续右键');
+            } else {
+                ctx.reply('[使用] 当前未在持续右键');
+            }
+        });
+
+    // ---- 信息查询 ----
+
+    cmd('/nearby', ['/nearby'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/nearby — 查看附近实体（玩家 & 生物）',
+        (ctx) => {
+            const pos = bot.entity?.position;
+            if (!pos) { ctx.reply('[附近] 机器人尚未完全加载'); return; }
+            const lines = [];
+
+            const players = Object.values(bot.players).filter(p => p.entity && p.username !== bot.username);
+            if (players.length > 0) {
+                lines.push('=== 玩家 ===');
+                players.forEach(p => {
+                    const dist = Math.round(pos.distanceTo(p.entity.position) * 10) / 10;
+                    lines.push(`${p.username} (${dist}m)`);
+                });
+            }
+
+            const mobs = Object.values(bot.entities).filter(e =>
+                e.type === 'mob' && e.name && e.position && pos.distanceTo(e.position) <= 30
+            ).sort((a, b) => pos.distanceTo(a.position) - pos.distanceTo(b.position)).slice(0, 20);
+
+            if (mobs.length > 0) {
+                lines.push('=== 生物 ===');
+                mobs.forEach(e => {
+                    const dist = Math.round(pos.distanceTo(e.position) * 10) / 10;
+                    const health = e.health !== undefined ? ` ❤${Math.round(e.health)}` : '';
+                    const name = e.displayName || e.name || '(未知)';
+                    lines.push(`${name} (${dist}m)${health}`);
+                });
+            }
+
+            ctx.reply(lines.length === 0 ? '[附近] 附近没有实体' : `[附近]\n${lines.join('\n')}`);
+        });
+
+    // ---- 菜单操作 ----
+
+    cmd('/menu', ['/menu'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/menu [关键词] — 打开菜单或搜索物品',
+        (ctx, args) => {
+            if (args) {
+                // 交互式菜单搜索
+                console.log(`${PREFIX} [搜索] ${ctx.sender} 搜索菜单: "${args}"`);
+                clearPendingConfirm();
+                menuSearch = { player: ctx.sender, keyword: args };
+                safeChat('/menu');
+            } else {
+                // 手动打开菜单
+                menuDone = false;
+                safeChat('/menu');
+                ctx.reply('已发送 /menu');
+            }
+        });
+
+    cmd('/confirm', ['/confirm'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/confirm — 确认菜单搜索点击',
+        (ctx) => {
+            if (!pendingConfirm || pendingConfirm.player !== ctx.sender) {
+                ctx.reply('[搜索] 没有待确认的操作');
                 return;
             }
             const pc = pendingConfirm;
             clearPendingConfirm();
-            console.log(`${PREFIX} [搜索] ${username} 确认点击栏位 ${pc.slot}: ${pc.itemName}`);
+            console.log(`${PREFIX} [搜索] ${ctx.sender} 确认点击栏位 ${pc.slot}: ${pc.itemName}`);
 
             if (bot.activateItemInterval) {
                 clearInterval(bot.activateItemInterval);
@@ -717,339 +1026,98 @@ function createBotInstance(config, options = {}) {
             };
             setTimeout(() => { bot._client.write = originalWrite; }, 5000);
 
-            safeWhisper(username, `[搜索] 已点击 ${pc.itemName}`);
-            return;
-        }
+            ctx.reply(`[搜索] 已点击 ${pc.itemName}`);
+        });
 
-        // ==================== 信任玩家管理 ====================
+    // ---- 信任玩家管理 ----
 
-        if (message === '/trust' || message === '/trust list') {
-            if (!trustedPlayers.includes(username)) {
-                safeWhisper(username, '[信任] 你没有权限管理信任列表');
-                return;
-            }
+    cmd('/trust', ['/trust', '/trust list'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/trust [list] — 查看信任玩家列表',
+        (ctx) => {
             if (trustedPlayers.length === 0) {
-                safeWhisper(username, '[信任] 当前无信任玩家');
+                ctx.reply('[信任] 当前无信任玩家');
             } else {
-                safeWhisper(username, `[信任] 信任玩家列表 (${trustedPlayers.length}人):\n${trustedPlayers.join('\n')}`);
+                ctx.reply(`[信任] 信任玩家列表 (${trustedPlayers.length}人):\n${trustedPlayers.join('\n')}`);
             }
-            return;
-        }
+        });
 
-        if (message.startsWith('/trust add ') && trustedPlayers.includes(username)) {
-            const targetPlayer = message.slice(11).trim();
-            if (!targetPlayer) {
-                safeWhisper(username, '[信任] 用法: /trust add <玩家名>');
-                return;
-            }
+    cmd('/trust add', ['/trust add'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/trust add <玩家名> — 添加信任玩家',
+        (ctx, args) => {
+            const targetPlayer = args.trim();
+            if (!targetPlayer) { ctx.reply('[信任] 用法: /trust add <玩家名>'); return; }
             if (trustedPlayers.includes(targetPlayer)) {
-                safeWhisper(username, `[信任] ${targetPlayer} 已在信任列表中`);
+                ctx.reply(`[信任] ${targetPlayer} 已在信任列表中`);
                 return;
             }
             trustedPlayers.push(targetPlayer);
             saveTrustedPlayers();
-            safeWhisper(username, `[信任] 已添加 ${targetPlayer} 到信任列表`);
-            console.log(`${PREFIX} [信任] ${username} 添加了 ${targetPlayer}`);
-            return;
-        }
+            ctx.reply(`[信任] 已添加 ${targetPlayer} 到信任列表`);
+            console.log(`${PREFIX} [信任] ${ctx.sender} 添加了 ${targetPlayer}`);
+        });
 
-        if (message.startsWith('/trust remove ') && trustedPlayers.includes(username)) {
-            const targetPlayer = message.slice(14).trim();
-            if (!targetPlayer) {
-                safeWhisper(username, '[信任] 用法: /trust remove <玩家名>');
-                return;
-            }
+    cmd('/trust remove', ['/trust remove'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/trust remove <玩家名> — 移除信任玩家',
+        (ctx, args) => {
+            const targetPlayer = args.trim();
+            if (!targetPlayer) { ctx.reply('[信任] 用法: /trust remove <玩家名>'); return; }
             const idx = trustedPlayers.indexOf(targetPlayer);
-            if (idx === -1) {
-                safeWhisper(username, `[信任] ${targetPlayer} 不在信任列表中`);
-                return;
-            }
+            if (idx === -1) { ctx.reply(`[信任] ${targetPlayer} 不在信任列表中`); return; }
             trustedPlayers.splice(idx, 1);
             saveTrustedPlayers();
-            safeWhisper(username, `[信任] 已从信任列表移除 ${targetPlayer}`);
-            console.log(`${PREFIX} [信任] ${username} 移除了 ${targetPlayer}`);
-            return;
-        }
+            ctx.reply(`[信任] 已从信任列表移除 ${targetPlayer}`);
+            console.log(`${PREFIX} [信任] ${ctx.sender} 移除了 ${targetPlayer}`);
+        });
 
-        // ==================== 本地机器人大脑指令 ====================
+    // ---- 机器人管理 ----
 
-        if (message === '/help' && trustedPlayers.includes(username)) {
-            safeWhisper(username, `[帮助] 可用指令:
-/inv — 查看物品栏
-/hotbar <1-9> — 切换快捷栏
-/drop <物品名> [数量] — 丢弃物品
-/dropstack — 丢弃手中整组物品
-/equip <物品名> — 装备物品到手中
-/attack [实体名] — 攻击最近实体
-/use — 使用手中物品
-/use hold — 开始持续右键
-/use stop — 停止持续右键
-/nearby — 查看附近实体
-/trust — 查看信任玩家列表
-/trust add <玩家名> — 添加信任玩家
-/trust remove <玩家名> — 移除信任玩家
-/bot add <用户名> <密码> — 添加机器人(默认不启动)
-/bot del <用户名> — 移除机器人
-/bot enable <用户名> — 设为默认启动
-/bot kill <用户名> — 下线机器人
-/bot spawn <用户名> — 上线机器人
-/help — 显示此帮助`);
-            return;
-        }
-
-        if ((message === '/inv' || message === '/inventory') && trustedPlayers.includes(username)) {
-            const items = bot.inventory.items();
-            if (items.length === 0) {
-                safeWhisper(username, '[物品栏] 物品栏为空');
-                return;
-            }
-            const hotbarSlot = bot.quickBarSlot;
-            const lines = items.map((item, i) => {
-                const name = formatItemName(item);
-                const slot = item.slot;
-                const isHotbar = slot >= 36 && slot <= 44;
-                const marker = isHotbar ? (slot - 36 === hotbarSlot ? ' [当前手持]' : ' [快捷栏]') : '';
-                return `栏${slot} ${name} x${item.count}${marker}`;
-            });
-            safeWhisper(username, `[物品栏] 共 ${items.length} 种物品:\n${lines.join('\n')}`);
-            return;
-        }
-
-        if (message.startsWith('/hotbar ') && trustedPlayers.includes(username)) {
-            const slot = parseInt(message.split(' ')[1]);
-            if (isNaN(slot) || slot < 1 || slot > 9) {
-                safeWhisper(username, '[切换] 用法: /hotbar <1-9>');
-                return;
-            }
-            bot.setQuickBarSlot(slot - 1);
-            const item = bot.heldItem;
-            safeWhisper(username, `[切换] 已切换到快捷栏 ${slot}: ${formatItemName(item)}`);
-            return;
-        }
-
-        if (message.startsWith('/drop ') && trustedPlayers.includes(username)) {
-            const parts = message.split(' ');
-            const countStr = parts[parts.length - 1];
-            const isCount = /^\d+$/.test(countStr);
-            const count = isCount ? parseInt(countStr) : 1;
-            const nameParts = isCount ? parts.slice(1, -1) : parts.slice(1);
-            const itemName = nameParts.join(' ').toLowerCase();
-
-            const item = bot.inventory.items().find(it => {
-                return it.name?.toLowerCase().includes(itemName) ||
-                    formatItemName(it).toLowerCase().includes(itemName);
-            });
-
-            if (!item) {
-                safeWhisper(username, `[丢弃] 物品栏中没有找到 "${nameParts.join(' ')}"`);
-                return;
-            }
-            try {
-                await bot.toss(item.type, null, Math.min(count, item.count));
-                safeWhisper(username, `[丢弃] 已丢弃 ${formatItemName(item)} x${Math.min(count, item.count)}`);
-            } catch (err) {
-                safeWhisper(username, `[丢弃] 失败: ${err.message}`);
-            }
-            return;
-        }
-
-        if (message === '/dropstack' && trustedPlayers.includes(username)) {
-            if (!bot.heldItem) {
-                safeWhisper(username, '[丢弃] 手中没有物品');
-                return;
-            }
-            try {
-                const itemName = formatItemName(bot.heldItem);
-                await bot.tossStack(bot.heldItem);
-                safeWhisper(username, `[丢弃] 已丢弃整组: ${itemName}`);
-            } catch (err) {
-                safeWhisper(username, `[丢弃] 失败: ${err.message}`);
-            }
-            return;
-        }
-
-        if (message.startsWith('/equip ') && trustedPlayers.includes(username)) {
-            const equipName = message.slice(7).trim().toLowerCase();
-            const item = bot.inventory.items().find(it => {
-                return it.name?.toLowerCase().includes(equipName) ||
-                    formatItemName(it).toLowerCase().includes(equipName);
-            });
-            if (!item) {
-                safeWhisper(username, `[装备] 物品栏中没有找到 "${message.slice(7).trim()}"`);
-                return;
-            }
-            try {
-                await bot.equip(item, 'hand');
-                safeWhisper(username, `[装备] 已装备: ${formatItemName(item)}`);
-            } catch (err) {
-                safeWhisper(username, `[装备] 失败: ${err.message}`);
-            }
-            return;
-        }
-
-        if (message.startsWith('/attack') && trustedPlayers.includes(username)) {
-            const targetName = message.slice(8).trim().toLowerCase();
-            let target;
-            if (targetName) {
-                target = bot.nearestEntity(e => {
-                    return e.name && e.name.toLowerCase().includes(targetName);
-                });
-                if (!target) {
-                    safeWhisper(username, `[攻击] 附近没有找到 "${message.slice(8).trim()}"`);
-                    return;
-                }
-            } else {
-                target = bot.nearestEntity(e => e.kind === 'hostile');
-                if (!target) {
-                    safeWhisper(username, '[攻击] 附近没有敌对生物');
-                    return;
-                }
-            }
-            try {
-                bot.attack(target);
-                safeWhisper(username, `[攻击] 正在攻击: ${target.displayName || target.name}${target.username ? ' (' + target.username + ')' : ''}`);
-            } catch (err) {
-                safeWhisper(username, `[攻击] 失败: ${err.message}`);
-            }
-            return;
-        }
-
-        if (message === '/use' && trustedPlayers.includes(username)) {
-            if (!bot.heldItem) {
-                safeWhisper(username, '[使用] 手中没有物品');
-                return;
-            }
-            bot.activateItem();
-            setTimeout(() => {
-                if (bot.usingHeldItem) {
-                    bot.deactivateItem();
-                }
-            }, 100);
-            safeWhisper(username, `[使用] 已使用: ${formatItemName(bot.heldItem)}`);
-            return;
-        }
-
-        if (message === '/use hold' && trustedPlayers.includes(username)) {
-            if (bot.activateItemInterval) {
-                clearInterval(bot.activateItemInterval);
-            }
-            bot.activateItemInterval = setInterval(() => bot.activateItem(), 50);
-            safeWhisper(username, '[使用] 已开始持续右键');
-            return;
-        }
-
-        if (message === '/use stop' && trustedPlayers.includes(username)) {
-            if (bot.activateItemInterval) {
-                clearInterval(bot.activateItemInterval);
-                bot.activateItemInterval = null;
-                safeWhisper(username, '[使用] 已停止持续右键');
-            } else {
-                safeWhisper(username, '[使用] 当前未在持续右键');
-            }
-            return;
-        }
-
-        if (message === '/nearby' && trustedPlayers.includes(username)) {
-            const pos = bot.entity?.position;
-            if (!pos) {
-                safeWhisper(username, '[附近] 机器人尚未完全加载');
-                return;
-            }
-            const lines = [];
-
-            const players = Object.values(bot.players).filter(p => p.entity && p.username !== bot.username);
-            if (players.length > 0) {
-                lines.push('=== 玩家 ===');
-                players.forEach(p => {
-                    const dist = Math.round(pos.distanceTo(p.entity.position) * 10) / 10;
-                    lines.push(`${p.username} (${dist}m)`);
-                });
-            }
-
-            const mobs = Object.values(bot.entities).filter(e => {
-                return e.type === 'mob' && e.name && e.position &&
-                    pos.distanceTo(e.position) <= 30;
-            }).sort((a, b) => pos.distanceTo(a.position) - pos.distanceTo(b.position)).slice(0, 20);
-
-            if (mobs.length > 0) {
-                lines.push('=== 生物 ===');
-                mobs.forEach(e => {
-                    const dist = Math.round(pos.distanceTo(e.position) * 10) / 10;
-                    const health = e.health !== undefined ? ` ❤${Math.round(e.health)}` : '';
-                    const name = e.displayName || e.name || '(未知)';
-                    lines.push(`${name} (${dist}m)${health}`);
-                });
-            }
-
-            if (lines.length === 0) {
-                safeWhisper(username, '[附近] 附近没有实体');
-            } else {
-                safeWhisper(username, `[附近]\n${lines.join('\n')}`);
-            }
-            return;
-        }
-
-        // ==================== 机器人管理指令 ====================
-
-        // /bot add <username> <password> — 添加机器人到配置但不启动
-        if (message.startsWith('/bot add ') && trustedPlayers.includes(username)) {
-            const parts = message.slice(9).trim().split(/\s+/);
-            if (parts.length < 2) {
-                safeWhisper(username, '[Bot管理] 用法: /bot add <用户名> <密码>');
-                return;
-            }
+    cmd('/bot add', ['/bot add'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/bot add <用户名> <密码> — 添加机器人（默认不启动）',
+        (ctx, args) => {
+            const parts = args.trim().split(/\s+/);
+            if (parts.length < 2) { ctx.reply('[Bot管理] 用法: /bot add <用户名> <密码>'); return; }
             const newUsername = parts[0];
             const newPassword = parts.slice(1).join(' ');
             const lowerUser = newUsername.toLowerCase();
 
-            // 检查是否已存在
             const existing = (rootConfig && rootConfig.bots || []).find(b => (b.username || '').toLowerCase() === lowerUser);
-            if (existing) {
-                safeWhisper(username, `[Bot管理] 机器人 ${newUsername} 已在配置中`);
-                return;
-            }
+            if (existing) { ctx.reply(`[Bot管理] 机器人 ${newUsername} 已在配置中`); return; }
 
-            // 添加到配置
             const newBot = {
-                name: newUsername,
-                host,
-                port,
-                username: newUsername,
-                password: newPassword,
-                ai_provider: aiProvider,
-                enabled: false,
+                name: newUsername, host, port, username: newUsername,
+                password: newPassword, ai_provider: aiProvider, enabled: false,
             };
-            if (rootConfig && rootConfig.bots) {
-                rootConfig.bots.push(newBot);
-            }
+            if (rootConfig && rootConfig.bots) rootConfig.bots.push(newBot);
             if (saveBotsConfig) saveBotsConfig();
-            safeWhisper(username, `[Bot管理] 已添加机器人 ${newUsername}（默认不启动）。使用 /bot spawn ${newUsername} 上线`);
-            console.log(`${PREFIX} [Bot管理] ${username} 添加了机器人 ${newUsername}`);
-            return;
-        }
+            ctx.reply(`[Bot管理] 已添加机器人 ${newUsername}（默认不启动）。使用 /bot spawn ${newUsername} 上线`);
+            console.log(`${PREFIX} [Bot管理] ${ctx.sender} 添加了机器人 ${newUsername}`);
+        });
 
-        // /bot del <username> — 从配置中移除机器人
-        if (message.startsWith('/bot del ') && trustedPlayers.includes(username)) {
-            const targetUser = message.slice(9).trim();
-            if (!targetUser) {
-                safeWhisper(username, '[Bot管理] 用法: /bot del <用户名>');
-                return;
-            }
+    cmd('/bot del', ['/bot del'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/bot del <用户名> — 移除机器人',
+        (ctx, args) => {
+            const targetUser = args.trim();
+            if (!targetUser) { ctx.reply('[Bot管理] 用法: /bot del <用户名>'); return; }
             const lowerTarget = targetUser.toLowerCase();
 
-            // 不允许删除自己
             if (lowerTarget === bot.username.toLowerCase()) {
-                safeWhisper(username, '[Bot管理] 不能删除当前正在使用的机器人，请通过其他机器人操作');
+                ctx.reply('[Bot管理] 不能删除当前正在使用的机器人，请通过其他机器人操作');
                 return;
             }
 
             const idx = (rootConfig && rootConfig.bots || []).findIndex(b => (b.username || '').toLowerCase() === lowerTarget);
-            if (idx === -1) {
-                safeWhisper(username, `[Bot管理] 未找到机器人 ${targetUser}`);
-                return;
-            }
+            if (idx === -1) { ctx.reply(`[Bot管理] 未找到机器人 ${targetUser}`); return; }
 
-            // 如果正在运行，先下线
             if (botRegistry && botRegistry.has(lowerTarget)) {
                 const targetBot = botRegistry.get(lowerTarget);
                 try { targetBot.end(); } catch (e) {}
@@ -1058,99 +1126,102 @@ function createBotInstance(config, options = {}) {
 
             rootConfig.bots.splice(idx, 1);
             if (saveBotsConfig) saveBotsConfig();
-            safeWhisper(username, `[Bot管理] 已移除机器人 ${targetUser}`);
-            console.log(`${PREFIX} [Bot管理] ${username} 移除了机器人 ${targetUser}`);
-            return;
-        }
+            ctx.reply(`[Bot管理] 已移除机器人 ${targetUser}`);
+            console.log(`${PREFIX} [Bot管理] ${ctx.sender} 移除了机器人 ${targetUser}`);
+        });
 
-        // /bot enable <username> — 允许机器人默认启动
-        if (message.startsWith('/bot enable ') && trustedPlayers.includes(username)) {
-            const targetUser = message.slice(12).trim();
-            if (!targetUser) {
-                safeWhisper(username, '[Bot管理] 用法: /bot enable <用户名>');
-                return;
-            }
+    cmd('/bot enable', ['/bot enable'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/bot enable <用户名> — 设为默认启动',
+        (ctx, args) => {
+            const targetUser = args.trim();
+            if (!targetUser) { ctx.reply('[Bot管理] 用法: /bot enable <用户名>'); return; }
             const botCfg = (rootConfig && rootConfig.bots || []).find(b => (b.username || '').toLowerCase() === targetUser.toLowerCase());
-            if (!botCfg) {
-                safeWhisper(username, `[Bot管理] 未找到机器人 ${targetUser}`);
-                return;
-            }
+            if (!botCfg) { ctx.reply(`[Bot管理] 未找到机器人 ${targetUser}`); return; }
             botCfg.enabled = true;
             if (saveBotsConfig) saveBotsConfig();
-            safeWhisper(username, `[Bot管理] 机器人 ${targetUser} 已设为默认启动`);
-            console.log(`${PREFIX} [Bot管理] ${username} 启用了机器人 ${targetUser} 的默认启动`);
-            return;
-        }
+            ctx.reply(`[Bot管理] 机器人 ${targetUser} 已设为默认启动`);
+            console.log(`${PREFIX} [Bot管理] ${ctx.sender} 启用了机器人 ${targetUser} 的默认启动`);
+        });
 
-        // /bot kill <username> — 将机器人下线
-        if (message.startsWith('/bot kill ') && trustedPlayers.includes(username)) {
-            const targetUser = message.slice(10).trim();
-            if (!targetUser) {
-                safeWhisper(username, '[Bot管理] 用法: /bot kill <用户名>');
-                return;
-            }
+    cmd('/bot kill', ['/bot kill'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/bot kill <用户名> — 下线机器人',
+        (ctx, args) => {
+            const targetUser = args.trim();
+            if (!targetUser) { ctx.reply('[Bot管理] 用法: /bot kill <用户名>'); return; }
             const lowerTarget = targetUser.toLowerCase();
 
-            // 不允许 kill 自己
             if (lowerTarget === bot.username.toLowerCase()) {
-                safeWhisper(username, '[Bot管理] 不能通过 /bot kill 下线自己，请从其他机器人操作');
+                ctx.reply('[Bot管理] 不能通过 /bot kill 下线自己，请从其他机器人操作');
                 return;
             }
 
             if (!botRegistry || !botRegistry.has(lowerTarget)) {
-                safeWhisper(username, `[Bot管理] 机器人 ${targetUser} 未在运行`);
+                ctx.reply(`[Bot管理] 机器人 ${targetUser} 未在运行`);
                 return;
             }
 
             const targetBot = botRegistry.get(lowerTarget);
             try { targetBot.end(); } catch (e) {}
             botRegistry.delete(lowerTarget);
-            safeWhisper(username, `[Bot管理] 机器人 ${targetUser} 已下线`);
-            console.log(`${PREFIX} [Bot管理] ${username} 将机器人 ${targetUser} 下线`);
-            return;
-        }
+            ctx.reply(`[Bot管理] 机器人 ${targetUser} 已下线`);
+            console.log(`${PREFIX} [Bot管理] ${ctx.sender} 将机器人 ${targetUser} 下线`);
+        });
 
-        // /bot spawn <username> — 将机器人上线
-        if (message.startsWith('/bot spawn ') && trustedPlayers.includes(username)) {
-            const targetUser = message.slice(11).trim();
-            if (!targetUser) {
-                safeWhisper(username, '[Bot管理] 用法: /bot spawn <用户名>');
-                return;
-            }
+    cmd('/bot spawn', ['/bot spawn'],
+        TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/bot spawn <用户名> — 上线机器人',
+        (ctx, args) => {
+            const targetUser = args.trim();
+            if (!targetUser) { ctx.reply('[Bot管理] 用法: /bot spawn <用户名>'); return; }
             const botCfg = (rootConfig && rootConfig.bots || []).find(b => (b.username || '').toLowerCase() === targetUser.toLowerCase());
-            if (!botCfg) {
-                safeWhisper(username, `[Bot管理] 未找到机器人 ${targetUser}，请先使用 /bot add 添加`);
-                return;
-            }
+            if (!botCfg) { ctx.reply(`[Bot管理] 未找到机器人 ${targetUser}，请先使用 /bot add 添加`); return; }
             if (spawnBotFromConfig) {
                 const result = spawnBotFromConfig(botCfg);
-                if (result) {
-                    safeWhisper(username, `[Bot管理] ${result}`);
-                } else {
-                    safeWhisper(username, `[Bot管理] 机器人 ${targetUser} 已上线`);
-                }
+                if (result) { ctx.reply(`[Bot管理] ${result}`); }
+                else { ctx.reply(`[Bot管理] 机器人 ${targetUser} 已上线`); }
             } else {
-                safeWhisper(username, '[Bot管理] 不支持动态启动机器人');
+                ctx.reply('[Bot管理] 不支持动态启动机器人');
             }
-            return;
+        });
+
+    // ========== 事件处理器 ==========
+
+    // 公聊事件
+    bot.on('chat', (username, message) => {
+        const isTrusted = trustedPlayers.includes(username);
+
+        // 检测 @提及 / >> 回复
+        const mentionPrefixes = [`>>${bot.username}`, `@${bot.username}`];
+        for (const prefix of mentionPrefixes) {
+            if (message.startsWith(prefix)) {
+                const content = message.slice(prefix.length).trim();
+                if (!content) return;
+                const triggerFlag = prefix.startsWith('>>') ? TRIGGER.REPLY : TRIGGER.MENTION;
+                const ctx = createMessageContext(
+                    prefix.startsWith('>>') ? 'reply' : 'mention',
+                    triggerFlag, username, content, isTrusted
+                );
+                dispatchMessage(ctx);
+                return;
+            }
         }
 
-        // ==================== 远程命令转发 ====================
+        // 无前缀的公聊消息
+        const ctx = createMessageContext('chat', TRIGGER.CHAT, username, message, isTrusted);
+        dispatchMessage(ctx);
+    });
 
-        if (message.startsWith('/') && trustedPlayers.includes(username)) {
-            console.log(`${PREFIX} [命令] ${username} 执行: ${message}`);
-            cmdCapture = {
-                target: username,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 1500),
-            };
-            safeChat(message);
-        }
-    }
-
-    // ========== whisper 事件入口 ==========
+    // 私聊事件
     bot.on('whisper', (username, message) => {
-        handleWhisper(username, message);
+        console.log(`${PREFIX} [私聊] ${username}: ${message}`);
+        const isTrusted = trustedPlayers.includes(username);
+        const ctx = createMessageContext('whisper', TRIGGER.WHISPER, username, message, isTrusted);
+        dispatchMessage(ctx);
     });
 
     return bot;
