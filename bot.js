@@ -608,6 +608,7 @@ function createBotInstance(config, options = {}) {
         MENTION: 1 << 2,  // 公聊 @botname
         REPLY:   1 << 3,  // 公聊 >>botname
         QQ_AT:   1 << 4,  // QQ群 @botname
+        WEB:     1 << 5,  // Web 管理面板
     };
 
     const TARGET = {
@@ -643,7 +644,7 @@ function createBotInstance(config, options = {}) {
 
     function createMessageContext(type, triggerFlag, sender, content, isTrusted) {
         return {
-            type,          // 'chat' | 'whisper' | 'mention' | 'reply' | 'qq_at'
+            type,          // 'chat' | 'whisper' | 'mention' | 'reply' | 'qq_at' | 'web'
             triggerFlag,   // 匹配的 TRIGGER 位
             sender,        // 发送者用户名
             content,       // 清洗后的消息内容（不含 @botname / >>botname 等前缀）
@@ -652,6 +653,12 @@ function createBotInstance(config, options = {}) {
             reply(text) {
                 if (type === 'whisper') safeWhisper(sender, text);
                 else if (type === 'qq_at') sendQQReply(text);
+                else if (type === 'web') {
+                    // Web 端回复：存入 bot._webReply 供 API 读取，同时输出到控制台
+                    if (!bot._webReply) bot._webReply = [];
+                    bot._webReply.push(text);
+                    console.log(`${PREFIX} [Web回复] ${text}`);
+                }
                 else safeChat(text); // chat / mention / reply → 公聊
             },
         };
@@ -742,13 +749,13 @@ function createBotInstance(config, options = {}) {
     // ---- 公共命令（所有人可用） ----
 
     cmd('/ping', ['/ping', 'ping'],
-        TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
+        TRIGGER.WEB | TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.ALL,
         '/ping — 测试机器人是否在线',
         (ctx) => { ctx.reply('pong!'); });
 
     cmd('/v50', ['/v50', 'v50'],
-        TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
+        TRIGGER.WEB | TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.ALL,
         '/v50 — 疯狂星期四文案',
         async (ctx) => {
@@ -766,7 +773,7 @@ function createBotInstance(config, options = {}) {
     // ---- 帮助（自动生成） ----
 
     cmd('/help', ['/help'],
-        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT | TRIGGER.WEB,
         TARGET.TRUSTED,
         '/help — 显示此帮助',
         (ctx) => {
@@ -780,7 +787,7 @@ function createBotInstance(config, options = {}) {
     // ---- 物品栏 / 快捷栏 ----
 
     cmd('/inv', ['/inv', '/inventory'],
-        TRIGGER.WHISPER,
+        TRIGGER.WHISPER | TRIGGER.WEB,
         TARGET.TRUSTED,
         '/inv — 查看物品栏',
         (ctx) => {
@@ -798,7 +805,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/hotbar', ['/hotbar'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/hotbar <1-9> — 切换快捷栏',
         (ctx, args) => {
@@ -811,7 +818,7 @@ function createBotInstance(config, options = {}) {
     // ---- 物品操作 ----
 
     cmd('/drop', ['/drop'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/drop <物品名> [数量] — 丢弃物品',
         async (ctx, args) => {
@@ -836,7 +843,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/dropstack', ['/dropstack'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/dropstack — 丢弃手中整组物品',
         async (ctx) => {
@@ -851,7 +858,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/equip', ['/equip'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/equip <物品名> — 装备物品到手中',
         async (ctx, args) => {
@@ -872,7 +879,7 @@ function createBotInstance(config, options = {}) {
     // ---- 攻击 ----
 
     cmd('/attack', ['/attack'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/attack [实体名] — 攻击最近实体（不填则攻击敌对生物）',
         (ctx, args) => {
@@ -896,7 +903,7 @@ function createBotInstance(config, options = {}) {
     // ---- 物品使用 ----
 
     cmd('/use', ['/use'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/use — 使用手中物品（单次）',
         (ctx) => {
@@ -907,7 +914,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/use hold', ['/use hold'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/use hold — 开始持续右键',
         (ctx) => {
@@ -917,7 +924,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/use stop', ['/use stop'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/use stop — 停止持续右键',
         (ctx) => {
@@ -933,7 +940,7 @@ function createBotInstance(config, options = {}) {
     // ---- 信息查询 ----
 
     cmd('/nearby', ['/nearby'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/nearby — 查看附近实体（玩家 & 生物）',
         (ctx) => {
@@ -970,7 +977,7 @@ function createBotInstance(config, options = {}) {
     // ---- 菜单操作 ----
 
     cmd('/menu', ['/menu'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/menu [关键词] — 打开菜单或搜索物品',
         (ctx, args) => {
@@ -989,7 +996,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/confirm', ['/confirm'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/confirm — 确认菜单搜索点击',
         (ctx) => {
@@ -1024,7 +1031,7 @@ function createBotInstance(config, options = {}) {
     // ---- 信任玩家管理 ----
 
     cmd('/trust', ['/trust', '/trust list'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/trust [list] — 查看信任玩家列表',
         (ctx) => {
@@ -1036,7 +1043,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/trust add', ['/trust add'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/trust add <玩家名> — 添加信任玩家',
         (ctx, args) => {
@@ -1053,7 +1060,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/trust remove', ['/trust remove'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/trust remove <玩家名> — 移除信任玩家',
         (ctx, args) => {
@@ -1070,7 +1077,7 @@ function createBotInstance(config, options = {}) {
     // ---- 机器人管理 ----
 
     cmd('/bot add', ['/bot add'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/bot add <用户名> <密码> — 添加机器人（默认不启动）',
         (ctx, args) => {
@@ -1094,7 +1101,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot del', ['/bot del'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/bot del <用户名> — 移除机器人',
         (ctx, args) => {
@@ -1123,7 +1130,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot enable', ['/bot enable'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/bot enable <用户名> — 设为默认启动',
         (ctx, args) => {
@@ -1138,7 +1145,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot kill', ['/bot kill'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/bot kill <用户名> — 下线机器人',
         (ctx, args) => {
@@ -1173,7 +1180,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot spawn', ['/bot spawn'],
-        TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
         '/bot spawn <用户名> — 上线机器人',
         (ctx, args) => {
@@ -1224,6 +1231,26 @@ function createBotInstance(config, options = {}) {
         const ctx = createMessageContext('whisper', TRIGGER.WHISPER, username, message, isTrusted);
         dispatchMessage(ctx);
     });
+
+    // ========== 外部命令执行接口（供 Web 面板等外部调用） ==========
+    // 优先匹配内部注册命令；未匹配则以服务器命令方式发送到公聊
+    // 回复内容存储在 bot._webReply 数组中，调用方可读取
+    bot.execCommand = async function (cmdText) {
+        const trimmed = cmdText.trim();
+        const match = findCommand(trimmed);
+        if (match) {
+            // 内部注册命令 — 以 Web 管理员身份执行
+            // 命令必须显式声明 TRIGGER.WEB 才能从 Web 端调用
+            // 回复走 'web' 类型 → 存入 bot._webReply，不尝试发私聊
+            bot._webReply = [];
+            const ctx = createMessageContext('web', TRIGGER.WEB, '__web_admin__', trimmed, true);
+            await dispatchMessage(ctx);
+        } else {
+            // 未匹配内部命令 → 作为服务器命令发送到公聊
+            const cmd = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+            safeChat(cmd);
+        }
+    };
 
     return bot;
 }

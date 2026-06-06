@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MC Bot 管理面板</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <!-- 顶部栏 -->
+    <header class="header">
+        <div class="header-left">
+            <h1>🟢 MC Bot 管理面板</h1>
+            <span class="connection-status" id="connectionStatus">● 已连接</span>
+        </div>
+        <div class="header-right">
+            <button class="btn btn-sm" id="refreshBtn" title="刷新状态">🔄 刷新</button>
+            <button class="btn btn-sm" id="toggleLogsBtn" title="显示/隐藏日志">📋 日志</button>
+        </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <main class="main">
+        <!-- Bot 卡片网格 -->
+        <section class="bot-grid" id="botGrid">
+            <div class="empty-state">
+                <p>加载中...</p>
+            </div>
+        </section>
+    </main>
+
+    <!-- 日志面板（可折叠） -->
+    <section class="log-panel" id="logPanel">
+        <div class="log-header">
+            <h3>📋 实时日志</h3>
+            <div class="log-controls">
+                <select id="logFilter" class="log-filter">
+                    <option value="">全部来源</option>
+                </select>
+                <button class="btn btn-xs" id="clearLogsBtn">清空</button>
+                <button class="btn btn-xs" id="hideLogsBtn">隐藏</button>
+            </div>
+        </div>
+        <div class="log-container" id="logContainer">
+            <div class="log-empty">等待日志...</div>
+        </div>
+    </section>
+
+    <!-- 指令弹窗模板（隐藏） -->
+    <div class="modal-overlay" id="cmdModal" style="display:none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="cmdModalTitle">发送指令</h3>
+                <button class="btn-close" id="cmdModalClose">&times;</button>
+            </div>
+            <div class="modal-body">
+                <select id="cmdType" class="cmd-type-select">
+                    <option value="exec">Bot 指令（优先匹配内部命令）</option>
+                    <option value="cmd">服务器命令（直接发送到服务器）</option>
+                    <option value="chat">公聊消息</option>
+                </select>
+                <textarea id="cmdInput" class="cmd-input" rows="3" placeholder="输入消息或命令..."></textarea>
+                <div class="modal-actions">
+                    <button class="btn btn-primary" id="cmdSendBtn">发送</button>
+                    <button class="btn" id="cmdCancelBtn">取消</button>
+                </div>
+                <div class="cmd-result" id="cmdResult"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>
