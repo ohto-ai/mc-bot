@@ -642,8 +642,9 @@ function createBotInstance(config, options = {}) {
 
     // 注册命令：cmd(名称, 匹配前缀数组, 触发条件, 触发对象, 帮助文本, 处理函数)
     // handler 签名: async (ctx, args) — ctx 为消息上下文，args 为命令参数
-    function cmd(name, patterns, triggers, target, help, handler) {
-        commandRegistry.push({ name, patterns, triggers, target, help, handler });
+    // toolAllowed: 是否允许 AI 将此命令作为工具调用（默认 false，需显式 opt-in）
+    function cmd(name, patterns, triggers, target, help, handler, toolAllowed = false) {
+        commandRegistry.push({ name, patterns, triggers, target, help, handler, toolAllowed });
     }
 
     // 查找匹配的命令（最长前缀匹配，确保 /trust add 优先于 /trust）
@@ -664,15 +665,21 @@ function createBotInstance(config, options = {}) {
 
     // ========== 消息上下文 ==========
 
-    function createMessageContext(type, triggerFlag, sender, content, isTrusted) {
+    // captureBuffer: 可选数组，传入时 ctx.reply() 将文本存入数组而非发送消息（供 AI 工具调用捕获输出）
+    function createMessageContext(type, triggerFlag, sender, content, isTrusted, captureBuffer) {
         return {
-            type,          // 'chat' | 'whisper' | 'mention' | 'reply' | 'qq_at' | 'web'
+            type,          // 'chat' | 'whisper' | 'mention' | 'reply' | 'qq_at' | 'web' | 'tool'
             triggerFlag,   // 匹配的 TRIGGER 位
             sender,        // 发送者用户名
             content,       // 清洗后的消息内容（不含 @botname / >>botname 等前缀）
             isTrusted,     // 是否为可信玩家
+            _captureBuffer: captureBuffer,
             // 根据消息类型原路返回
             reply(text) {
+                if (this._captureBuffer) {
+                    this._captureBuffer.push(text);
+                    return;
+                }
                 if (type === 'whisper') safeWhisper(sender, text);
                 else if (type === 'qq_at') sendQQReply(text);
                 else if (type === 'web') {
@@ -693,7 +700,16 @@ function createBotInstance(config, options = {}) {
         if (!prompt) return;
 
         console.log(`${PREFIX} [AI-${aiProvider}] ${ctx.sender} (${ctx.type}): ${prompt}`);
-        const reply = await queryAI(prompt);
+
+        // 生成可用工具列表（受信任用户更多工具）
+        const tools = buildToolDefinitions(ctx.isTrusted);
+        let reply;
+        if (tools.length > 0) {
+            reply = await queryAIWithTools(prompt, tools, ctx);
+        } else {
+            reply = await queryAI(prompt);
+        }
+
         console.log(`${PREFIX} [AI-${aiProvider}] 回复: ${reply}`);
         ctx.reply(`[AI] ${reply}`);
     }
@@ -709,6 +725,184 @@ function createBotInstance(config, options = {}) {
             timer: setTimeout(flushCmdCapture, 1500),
         };
         safeChat(ctx.content);
+    }
+
+    // ========== AI 工具调用：执行命令并捕获输出 ==========
+
+    // 将 AI 传来的工具名（无 /、空格用 _ 替代）还原为命令文本并执行
+    async function executeToolCall(toolName, args, originalCtx) {
+        // 下划线转回空格，拼成完整命令
+        const cmdName = '/' + toolName.replace(/_/g, ' ');
+        const match = findCommand(cmdName);
+        if (!match) return `[错误] 未知命令: ${cmdName}`;
+        if (!match.def.toolAllowed) return `[错误] 命令 ${cmdName} 不允许作为工具使用`;
+
+        const captureBuffer = [];
+        const cmdText = args ? `${cmdName} ${args}` : cmdName;
+        const toolCtx = createMessageContext('tool', 0, originalCtx.sender, cmdText, originalCtx.isTrusted, captureBuffer);
+
+        try {
+            console.log(`${PREFIX} [工具] ${originalCtx.sender} → ${match.def.name} ${args || ''}`);
+            await match.def.handler(toolCtx, args || '');
+        } catch (err) {
+            console.error(`${PREFIX} [工具错误] ${match.def.name}:`, err.message);
+            return `[错误] 命令执行失败: ${err.message}`;
+        }
+
+        const result = captureBuffer.join('\n') || `[工具] ${match.def.name} 执行完毕（无输出）`;
+        // 截断过长结果，避免 token 爆炸
+        return result.length > 2000 ? result.slice(0, 2000) + '\n...(结果已截断)' : result;
+    }
+
+    // ========== 生成 OpenAI 工具定义 ==========
+
+    const TOOL_BLOCKLIST = ['/help', '/menu', '/confirm', '/trust', '/trust add', '/trust remove',
+        '/bot add', '/bot del', '/bot enable', '/bot kill', '/bot spawn'];
+
+    function buildToolDefinitions(isTrusted) {
+        const tools = [];
+        for (const def of commandRegistry) {
+            if (!def.toolAllowed) continue;
+            if (TOOL_BLOCKLIST.includes(def.name)) continue;
+            if (def.target === TARGET.TRUSTED && !isTrusted) continue;
+
+            // 工具名：去掉 /、空格替换为 _（OpenAI 函数名要求 ^[a-zA-Z0-9_-]{1,64}$）
+            const toolName = def.name.replace(/^\//, '').replace(/\s+/g, '_');
+
+            // 从 help 文本提取描述
+            const helpText = def.help || '';
+            const descMatch = helpText.match(/[—\-]\s*(.+)/);
+            const description = descMatch ? descMatch[1].trim() : helpText;
+
+            // 从 help 文本提取参数说明
+            let argsDesc = '命令参数（通常不需要）';
+            const angleMatch = helpText.match(/<([^>]+)>/);
+            if (angleMatch) argsDesc = `必需参数: ${angleMatch[1]}`;
+            else {
+                const bracketMatch = helpText.match(/\[([^\]]+)\]/);
+                if (bracketMatch) argsDesc = `可选参数: ${bracketMatch[1]}`;
+            }
+
+            tools.push({
+                type: 'function',
+                function: {
+                    name: toolName,
+                    description: description,
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            args: {
+                                type: 'string',
+                                description: argsDesc,
+                            },
+                        },
+                        required: [],
+                    },
+                },
+            });
+        }
+        return tools;
+    }
+
+    // ========== 统一 AI API 调用（返回完整 message 对象，支持 tools） ==========
+
+    async function callAIApi(messages, tools) {
+        const isDeepSeek = aiProvider !== 'mimo';
+        const apiKey = isDeepSeek ? aiCfg.deepseekApiKey : aiCfg.mimoApiKey;
+        const apiUrl = isDeepSeek ? aiCfg.DEEPSEEK_API_URL : aiCfg.MIMO_API_URL;
+        const model = isDeepSeek ? aiCfg.DEEPSEEK_MODEL : aiCfg.MIMO_MODEL;
+        const providerName = isDeepSeek ? 'DeepSeek' : 'MiMo';
+
+        if (!apiKey) {
+            throw new Error(`[${providerName}] 未在 config.json 中设置 API 密钥`);
+        }
+
+        const body = { model, messages, max_tokens: 1024, temperature: 0.7 };
+        if (tools && tools.length > 0) {
+            body.tools = tools;
+            body.tool_choice = 'auto';
+        }
+
+        const res = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`[${providerName}] API 错误 ${res.status}: ${errText}`);
+        }
+
+        const data = await res.json();
+        const message = data.choices?.[0]?.message;
+        if (!message) throw new Error(`[${providerName}] 空响应`);
+        return message;
+    }
+
+    // ========== 支持工具调用的 AI 对话（多轮工具调用循环） ==========
+
+    async function queryAIWithTools(userMessage, tools, ctx) {
+        // 提示 AI 可以主动使用工具
+        const toolHint = ' 你可以使用提供的函数工具来获取实时信息或执行Minecraft游戏内操作。当用户询问需要查看或操作游戏内容的问题时，请主动调用合适的工具。';
+        const messages = [
+            { role: 'system', content: systemPrompt + toolHint },
+            { role: 'user', content: userMessage },
+        ];
+
+        let maxTurns = 5;
+
+        while (maxTurns-- > 0) {
+            let response;
+            try {
+                response = await callAIApi(messages, tools);
+            } catch (err) {
+                console.error(`${PREFIX} [AI-${aiProvider}] 工具调用循环中出错:`, err.message);
+                return `[AI] 请求失败: ${err.message}`;
+            }
+
+            // 无 tool_calls → 最终回复
+            if (!response.tool_calls || response.tool_calls.length === 0) {
+                return response.content || '';
+            }
+
+            // 追加 assistant 消息（含 tool_calls）
+            messages.push({
+                role: 'assistant',
+                content: response.content || null,
+                tool_calls: response.tool_calls,
+            });
+
+            // 逐个执行工具调用
+            for (const tc of response.tool_calls) {
+                if (tc.type !== 'function') continue;
+
+                const toolName = tc.function.name;
+                let toolArgs = '';
+                try {
+                    const parsed = JSON.parse(tc.function.arguments);
+                    toolArgs = parsed.args || '';
+                } catch (e) {
+                    toolArgs = tc.function.arguments || '';
+                }
+
+                console.log(`${PREFIX} [工具调用] ${toolName}(${toolArgs || '无参数'})`);
+                const result = await executeToolCall(toolName, toolArgs, ctx);
+                const shortResult = result.length > 150 ? result.slice(0, 150) + '...' : result;
+                console.log(`${PREFIX} [工具结果] ${shortResult}`);
+
+                messages.push({
+                    role: 'tool',
+                    tool_call_id: tc.id,
+                    content: result,
+                });
+            }
+        }
+
+        return '[AI] 工具调用次数过多，已自动终止。请稍后再试。';
     }
 
     // ========== 命令分发 ==========
@@ -760,6 +954,8 @@ function createBotInstance(config, options = {}) {
         // 无 / 的非命令消息 → AI 对话
         // 公聊无提及的消息不触发 AI（避免噪声）
         if (ctx.type === 'chat') return;
+        // AI 工具调用未匹配任何命令 → 直接返回（避免回退到 handleAIChat 导致递归）
+        if (ctx.type === 'tool') return;
 
         // 私聊 / @提及 / >>回复 / QQ群@ → 一律进入 AI 对话
         await handleAIChat(ctx);
@@ -775,7 +971,7 @@ function createBotInstance(config, options = {}) {
         TRIGGER.WEB | TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.ALL,
         '/ping — 测试机器人是否在线',
-        (ctx) => { ctx.reply('pong!'); });
+        (ctx) => { ctx.reply('pong!'); }, true);
 
     cmd('/v50', ['/v50', 'v50'],
         TRIGGER.WEB | TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
@@ -791,7 +987,7 @@ function createBotInstance(config, options = {}) {
                 console.error(`${PREFIX} KFC API 请求失败:`, err);
                 ctx.reply('疯狂星期四文案获取失败，但 V 我 50 的心是真的！');
             }
-        });
+        }, true);
 
     // ---- 帮助（自动生成） ----
 
@@ -834,7 +1030,7 @@ function createBotInstance(config, options = {}) {
                 return `栏${slot} ${name} x${item.count}${marker}`;
             });
             ctx.reply(`[物品栏] 共 ${items.length} 种物品:\n${lines.join('\n')}`);
-        });
+        }, true);
 
     cmd('/hotbar', ['/hotbar'],
         TRIGGER.WEB | TRIGGER.WHISPER,
@@ -845,7 +1041,7 @@ function createBotInstance(config, options = {}) {
             if (isNaN(slot) || slot < 1 || slot > 9) { ctx.reply('[切换] 用法: /hotbar <1-9>'); return; }
             bot.setQuickBarSlot(slot - 1);
             ctx.reply(`[切换] 已切换到快捷栏 ${slot}: ${formatItemName(bot.heldItem)}`);
-        });
+        }, true);
 
     // ---- 物品操作 ----
 
@@ -872,7 +1068,7 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[丢弃] 失败: ${err.message}`);
             }
-        });
+        }, true);
 
     cmd('/dropstack', ['/dropstack'],
         TRIGGER.WEB | TRIGGER.WHISPER,
@@ -887,7 +1083,7 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[丢弃] 失败: ${err.message}`);
             }
-        });
+        }, true);
 
     cmd('/equip', ['/equip'],
         TRIGGER.WEB | TRIGGER.WHISPER,
@@ -906,7 +1102,7 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[装备] 失败: ${err.message}`);
             }
-        });
+        }, true);
 
     // ---- 攻击 ----
 
@@ -930,7 +1126,7 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[攻击] 失败: ${err.message}`);
             }
-        });
+        }, true);
 
     // ---- 物品使用 ----
 
@@ -943,7 +1139,7 @@ function createBotInstance(config, options = {}) {
             bot.activateItem();
             setTimeout(() => { if (bot.usingHeldItem) bot.deactivateItem(); }, 100);
             ctx.reply(`[使用] 已使用: ${formatItemName(bot.heldItem)}`);
-        });
+        }, true);
 
     cmd('/use hold', ['/use hold'],
         TRIGGER.WEB | TRIGGER.WHISPER,
@@ -953,7 +1149,7 @@ function createBotInstance(config, options = {}) {
             if (bot.activateItemInterval) clearInterval(bot.activateItemInterval);
             bot.activateItemInterval = setInterval(() => bot.activateItem(), 50);
             ctx.reply('[使用] 已开始持续右键');
-        });
+        }, true);
 
     cmd('/use stop', ['/use stop'],
         TRIGGER.WEB | TRIGGER.WHISPER,
@@ -967,7 +1163,7 @@ function createBotInstance(config, options = {}) {
             } else {
                 ctx.reply('[使用] 当前未在持续右键');
             }
-        });
+        }, true);
 
     // ---- 信息查询 ----
 
@@ -1004,7 +1200,7 @@ function createBotInstance(config, options = {}) {
             }
 
             ctx.reply(lines.length === 0 ? '[附近] 附近没有实体' : `[附近]\n${lines.join('\n')}`);
-        });
+        }, true);
 
     // ---- 菜单操作 ----
 
