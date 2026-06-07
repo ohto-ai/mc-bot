@@ -252,21 +252,21 @@ function createBotInstance(config, options = {}) {
     }
 
     // ---- 长文本拆分（优先在标点处断句） ----
-    function splitByLength(text) {
-        if (text.length <= maxMsgLen) return [text];
+    function splitByLength(text, maxLen = maxMsgLen) {
+        if (text.length <= maxLen) return [text];
         const chunks = [];
         let remaining = text;
-        while (remaining.length > maxMsgLen) {
-            let cutAt = maxMsgLen;
-            const slice = remaining.slice(0, maxMsgLen);
+        while (remaining.length > maxLen) {
+            let cutAt = maxLen;
+            const slice = remaining.slice(0, maxLen);
             for (const sep of ['。', '！', '？', '.', '!', '?', '\n']) {
                 const pos = slice.lastIndexOf(sep);
-                if (pos > maxMsgLen / 2) { cutAt = pos + 1; break; }
+                if (pos > maxLen / 2) { cutAt = pos + 1; break; }
             }
-            if (cutAt === maxMsgLen) {
+            if (cutAt === maxLen) {
                 for (const sep of ['，', '、', '；', ',', ';']) {
                     const pos = slice.lastIndexOf(sep);
-                    if (pos > maxMsgLen / 2) { cutAt = pos + 1; break; }
+                    if (pos > maxLen / 2) { cutAt = pos + 1; break; }
                 }
             }
             chunks.push(remaining.slice(0, cutAt).trim());
@@ -324,8 +324,13 @@ function createBotInstance(config, options = {}) {
         return null;
     }
 
+    // QQ群消息最大长度（中英文均按1个字符计算）
+    const QQ_MAX_LEN = 100;
+
     function sendQQReply(message) {
-        messageQueue.push({ type: 'qq', message });
+        for (const chunk of splitByLength(message, QQ_MAX_LEN)) {
+            if (chunk) messageQueue.push({ type: 'qq', message: chunk });
+        }
         if (!queueProcessing) {
             processQueue();
         }
