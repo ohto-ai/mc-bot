@@ -874,7 +874,8 @@ function createBotInstance(config, options = {}) {
             + '当玩家询问金币余额等游戏内信息，或请求转账等游戏内操作时，你必须调用对应的工具函数来获取/执行，然后根据工具返回的真实结果回复。'
             + '严禁直接回复"我无法查看""我无法转账"等否定表述——工具赋予了你这些能力，直接使用即可。'
             + '注意：当玩家问"我有多少钱"或"查看XX的金币"时，必须将玩家ID作为参数传入money工具（如 money("玩家ID")），而不是无参调用。'
-            + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（看背包）等。';
+            + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（看机器人自身背包，无法查看玩家背包）等。'
+            + '特别提醒：inventory 工具只能查看机器人(Bot)自身的背包，无法查看玩家的背包。'
         const messages = [
             { role: 'system', content: systemPrompt + toolHint },
             { role: 'user', content: userMessage },
@@ -1044,10 +1045,10 @@ function createBotInstance(config, options = {}) {
     cmd('/inv', ['/inv', '/inventory'],
         TRIGGER.WHISPER | TRIGGER.WEB | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
-        '/inv — 查看物品栏',
+        '/inv — 查看机器人(Bot)自身的物品栏（无法查看玩家背包）',
         (ctx) => {
             const items = bot.inventory.items();
-            if (items.length === 0) { ctx.reply('[物品栏] 物品栏为空'); return; }
+            if (items.length === 0) { ctx.reply(`[${bot.username} 物品栏] 物品栏为空`); return; }
             const hotbarSlot = bot.quickBarSlot;
             const lines = items.map(item => {
                 const name = formatItemName(item);
@@ -1056,7 +1057,7 @@ function createBotInstance(config, options = {}) {
                 const marker = isHotbar ? (slot - 36 === hotbarSlot ? ' [当前手持]' : ' [快捷栏]') : '';
                 return `栏${slot} ${name} x${item.count}${marker}`;
             });
-            ctx.reply(`[物品栏] 共 ${items.length} 种物品:\n${lines.join('\n')}`);
+            ctx.reply(`[${bot.username} 物品栏] 共 ${items.length} 种物品:\n${lines.join('\n')}`);
         }, true);
 
     cmd('/hotbar', ['/hotbar'],
@@ -1227,6 +1228,82 @@ function createBotInstance(config, options = {}) {
             }
 
             ctx.reply(lines.length === 0 ? '[附近] 附近没有实体' : `[附近]\n${lines.join('\n')}`);
+        }, true);
+
+    cmd('/playerlist', ['/playerlist'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/playerlist — 查看全服在线玩家（自动包含本子服详情 + 全局各子服玩家列表）',
+        (ctx) => {
+            const players = Object.values(bot.players);
+            const header = (bot.tablist?.header?.toString() || '').trim();
+            const footer = (bot.tablist?.footer?.toString() || '').trim();
+
+            // 第一部分：本子服玩家详情
+            const lines = [];
+            if (header) lines.push(`[当前子服] ${header}`);
+            if (players.length > 0) {
+                lines.push(`--- 本子服玩家 (${players.length}) ---`);
+                const sorted = [...players].sort((a, b) => (a.ping || 0) - (b.ping || 0));
+                const gmNames = ['生存', '创造', '冒险', '旁观'];
+                sorted.forEach(p => {
+                    const gm = gmNames[p.gamemode] || `模式${p.gamemode}`;
+                    const ping = p.ping !== undefined ? `${p.ping}ms` : '?';
+                    const loaded = p.entity ? '✓' : '✗';
+                    lines.push(`${p.username} | ${gm} | Ping:${ping} | 视野内:${loaded}`);
+                });
+            } else {
+                lines.push('--- 本子服无其他玩家 ---');
+            }
+
+            // 第二部分：发送 /glist 查询全局各子服玩家
+            console.log(`${PREFIX} [查询] ${ctx.sender} 查询全服玩家列表`);
+            // 预加载本地数据到捕获缓冲区，glist 的服务器响应会追加在后面
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [...lines, '', '=== 全服玩家 (glist) ==='],  // 预填本地数据
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat('/glist');
+        }, true);
+
+    cmd('/glist', ['/glist'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/glist — 仅查询 BungeeCord/Velocity 全局各子服玩家（不含本子服详情）',
+        (ctx) => {
+            console.log(`${PREFIX} [查询] ${ctx.sender} 查询全局玩家列表`);
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [],
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat('/glist');
+        }, true);
+
+    cmd('/where', ['/where'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/where — 查看机器人当前位置、朝向和状态',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[位置] 机器人尚未完全加载'); return; }
+            const pos = entity.position;
+            const lines = [];
+            lines.push('=== 机器人状态 ===');
+            lines.push(`坐标: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`);
+            lines.push(`朝向: yaw=${entity.yaw.toFixed(1)}° pitch=${entity.pitch.toFixed(1)}°`);
+            const gmNames = ['生存', '创造', '冒险', '旁观'];
+            lines.push(`模式: ${gmNames[bot.game.gameMode] || bot.game.gameMode}`);
+            lines.push(`维度: ${bot.game.dimension || 'overworld'}`);
+            lines.push(`生命: ${Math.round(entity.health)}/${Math.round(entity.maxHealth || 20)}`);
+            lines.push(`饥饿: ${bot.food ?? '?'}/20`);
+            lines.push(`天气: ${bot.thunderState > 0 ? '⛈ 雷雨' : bot.rainState > 0 ? '🌧 下雨' : '☀ 晴朗'}`);
+            ctx.reply(lines.join('\n'));
         }, true);
 
     // ---- 经济系统 ----
