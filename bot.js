@@ -330,6 +330,250 @@ function createBotInstance(config, options = {}) {
     let botFollowTarget = null;
     let botFollowInterval = null;
     let aiCallCount = 0;
+    let botMiningActive = false; // 挖掘状态标志（/stop 可终止）
+
+    // ========== 挖掘工具匹配系统 ==========
+
+    // 工具材质等级（数字越大越好）
+    const TOOL_MATERIAL_TIER = {
+        'wooden': 1, 'stone': 2, 'iron': 3, 'golden': 4, 'diamond': 5, 'netherite': 6,
+    };
+
+    // 从物品名提取工具信息：{ type, material, tier }
+    function getToolInfo(itemName) {
+        if (!itemName) return null;
+        const name = itemName.toLowerCase();
+
+        // 剪刀
+        if (name.includes('shears')) return { type: 'shears', material: 'shears', tier: 10 };
+
+        const toolPatterns = [
+            { type: 'pickaxe', re: /pickaxe|pick\b/ },
+            { type: 'axe',     re: /\baxe\b|_axe|hatchet/ },
+            { type: 'shovel',  re: /shovel|spade/ },
+            { type: 'hoe',     re: /_hoe|hoe\b/ },
+            { type: 'sword',   re: /sword/ },
+        ];
+
+        for (const tp of toolPatterns) {
+            if (tp.re.test(name)) {
+                for (const [mat, tier] of Object.entries(TOOL_MATERIAL_TIER)) {
+                    if (name.includes(mat)) return { type: tp.type, material: mat, tier };
+                }
+                return { type: tp.type, material: 'unknown', tier: 0 };
+            }
+        }
+        return null;
+    }
+
+    // 根据方块名推断最佳工具类型
+    function getPreferredToolType(blockName) {
+        const name = (blockName || '').toLowerCase();
+
+        // 镐子类
+        if (/ore|stone\b|cobble|granite|diorite|andesite|deepslate|tuff|obsidian|netherrack|basalt|blackstone|end.?stone|brick|concrete|terracotta|furnace\b|iron_|gold_|copper_|diamond_|emerald_|redstone_|lapis|quartz|rail|spawner|enchant|anvil|hopper|dispenser|dropper|observer|piston|ice\b|packed_ice|blue_ice|calcite|amethyst|prismarine|purpur|shulker|glazed|beacon|chain\b|lantern|bell\b|grindstone|stonecutter|lodestone|pointed_dripstone|dripstone_block|copper|raw_|smithing|blast_furnace|smoker/.test(name)) {
+            return 'pickaxe';
+        }
+        // 斧头类
+        if (/log|wood|plank|fence|door|trapdoor|gate|sign|chest|barrel|crafting_table|loom|cartography|composter|note\b|jukebox|bookshelf|ladder|bamboo|mangrove|stem|hyphae|crimson|warped|beehive|bee_nest|cocoa|pumpkin|melon|mushroom/.test(name)) {
+            return 'axe';
+        }
+        // 铲子类
+        if (/dirt\b|grass|sand\b|gravel|clay\b|snow\b|soul_sand|soul_soil|farmland|mud\b|mycelium|podzol|rooted|concrete_powder/.test(name)) {
+            return 'shovel';
+        }
+        // 剪刀类
+        if (/leaves|wool|web|vine|grass\b|fern|dead_bush|seagrass|tall_grass|glow_lichen/.test(name)) {
+            return 'shears';
+        }
+        // 锄头类
+        if (/hay|target|dried_kelp|wart_block|shroomlight|sculk|moss|sponge/.test(name)) {
+            return 'hoe';
+        }
+
+        return null; // 任何工具或空手均可
+    }
+
+    // 从背包中找到最适合挖掘指定方块的物品
+    function findBestTool(bot, blockName) {
+        const preferred = getPreferredToolType(blockName);
+        const items = bot.inventory.items();
+
+        // 剪刀直接匹配
+        if (preferred === 'shears') {
+            const shears = items.find(it => (it.name || '').toLowerCase().includes('shears'));
+            if (shears) return shears;
+        }
+
+        let bestItem = null;
+        let bestScore = -1;
+
+        for (const item of items) {
+            const info = getToolInfo(item.name);
+            if (!info) continue;
+
+            let score = info.tier;
+            if (preferred && info.type === preferred) {
+                score += 100; // 类型匹配大幅加分
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestItem = item;
+            }
+        }
+
+        return bestItem; // null = 空手
+    }
+
+    // 方块是否值得挖掘
+    function isMineableBlock(block) {
+        if (!block) return false;
+        const name = (block.name || '').toLowerCase();
+        if (name === 'air' || name === 'cave_air' || name === 'void_air') return false;
+        if (name === 'bedrock') return false;
+        if (name === 'water' || name === 'lava' || name === 'bubble_column') return false;
+        if (name.includes('portal') || name === 'end_gateway') return false;
+        if (name === 'barrier' || name === 'structure_void') return false;
+        if (name.includes('command_block') || name.includes('jigsaw')) return false;
+        return true;
+    }
+
+    // 获取当前区块边界
+    function getChunkBounds(pos) {
+        const cx = Math.floor(pos.x / 16);
+        const cz = Math.floor(pos.z / 16);
+        return {
+            minX: cx * 16, maxX: cx * 16 + 15,
+            minZ: cz * 16, maxZ: cz * 16 + 15,
+            chunkX: cx, chunkZ: cz,
+        };
+    }
+
+    // 扫描区块内所有可挖掘方块（按距离排序，从近到远）
+    function scanChunkBlocks(maxCount = 5000) {
+        const entity = bot.entity;
+        if (!entity) return [];
+        const pos = entity.position;
+        const bounds = getChunkBounds(pos);
+
+        const blocks = [];
+        const yMin = Math.max(-64, Math.floor(pos.y) - 1); // 至少保留脚下的方块
+        const yMax = Math.min(320, Math.floor(pos.y) + 8);
+
+        for (let x = bounds.minX; x <= bounds.maxX; x++) {
+            for (let z = bounds.minZ; z <= bounds.maxZ; z++) {
+                for (let y = yMin; y <= yMax; y++) {
+                    const block = bot.blockAt(new Vec3(x, y, z));
+                    if (!isMineableBlock(block)) continue;
+
+                    const dist = pos.distanceTo(block.position);
+                    // 排除脚下方块（防止掉落）
+                    const dx = x - Math.floor(pos.x);
+                    const dz = z - Math.floor(pos.z);
+                    if (y <= Math.floor(pos.y) - 1 && dx === 0 && dz === 0) continue;
+
+                    blocks.push({ block, dist, x, y, z });
+                }
+                // 每列限制 Y 扫描范围，加速扫描
+            }
+        }
+
+        // 按距离排序（近到远）
+        blocks.sort((a, b) => a.dist - b.dist);
+        return blocks.slice(0, maxCount);
+    }
+
+    // 走向目标位置（简单的直线移动）
+    const Vec3 = require('vec3').Vec3;
+
+    function walkToPosition(targetPos, minDist = 2.5) {
+        return new Promise((resolve) => {
+            const checkInterval = 150;
+            const maxTime = 30000;
+            const startTime = Date.now();
+
+            const stopMove = () => {
+                for (const ctrl of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+                    bot.setControlState(ctrl, false);
+                }
+            };
+
+            function step() {
+                if (!botMiningActive) {
+                    stopMove();
+                    return resolve(false);
+                }
+
+                const myPos = bot.entity.position;
+                const dist = myPos.distanceTo(targetPos);
+                if (dist <= minDist) {
+                    stopMove();
+                    return resolve(true);
+                }
+
+                if (Date.now() - startTime > maxTime) {
+                    stopMove();
+                    return resolve(false);
+                }
+
+                bot.lookAt(targetPos.offset(0, 0.5, 0), true);
+
+                bot.setControlState('forward', true);
+                if (dist > 6) bot.setControlState('sprint', true);
+
+                // 只在目标明显高于自身时才启动飞行（飞行会降低挖掘效率）
+                // 阈值 3 格：普通跳跃+脚下垫方块可达 1-2 格高度差，超过 3 格才需要飞行
+                const dy = targetPos.y - myPos.y;
+                if (dy > 3) {
+                    bot.setControlState('jump', true);
+                } else {
+                    bot.setControlState('jump', false);
+                }
+
+                setTimeout(step, checkInterval);
+            }
+
+            step();
+        });
+    }
+
+    // 异步挖掘单个方块（自动切换工具）
+    async function mineSingleBlock(blockInfo) {
+        if (!botMiningActive) return false;
+        const { block, x, y, z } = blockInfo;
+
+        try {
+            // 1. 走到方块附近
+            const center = block.position.offset(0.5, 0.5, 0.5);
+            const reached = await walkToPosition(center, 4.0);
+            if (!reached) return false;
+
+            // 2. 切换最佳工具
+            const bestTool = findBestTool(bot, block.name);
+            if (bestTool && bot.heldItem !== bestTool) {
+                try {
+                    await bot.equip(bestTool, 'hand');
+                } catch (e) {
+                    // 装备失败，继续用手中物品
+                }
+            }
+
+            // 3. 看向方块并挖掘
+            bot.lookAt(center, true);
+            await new Promise(r => setTimeout(r, 300)); // 等待服务器确认视角
+
+            if (!botMiningActive) return false;
+
+            if (bot.canDigBlock(block)) {
+                await bot.dig(block, true, 'auto');
+                return true;
+            }
+        } catch (err) {
+            // 挖掘失败，跳过该方块
+        }
+        return false;
+    }
 
     // ---- 命令输出捕获（基于 correlation ID 的 Map，支持并发） ----
     const cmdCaptureMap = new Map(); // correlationId -> CaptureState
@@ -861,7 +1105,7 @@ function createBotInstance(config, options = {}) {
     // ========== 生成 OpenAI 工具定义 ==========
 
     const TOOL_BLOCKLIST = ['/menu', '/confirm', '/trust', '/trust add', '/trust remove',
-        '/bot add', '/bot del', '/bot enable', '/bot kill', '/bot spawn'];
+        '/bot add', '/bot del', '/bot enable'];
 
     function buildToolDefinitions(isTrusted) {
         const tools = [];
@@ -975,13 +1219,24 @@ function createBotInstance(config, options = {}) {
     // ========== 支持工具调用的 AI 对话（多轮工具调用循环） ==========
 
     async function queryAIWithTools(userMessage, tools, ctx) {
-        // 提示 AI 可以主动使用工具
-        // 强制工具使用提示：明确告知 AI 它有能力执行 Minecraft 服务器命令
-        const toolHint = ' 重要规则：你拥有函数工具（function tools），每个工具对应一个可在Minecraft服务器上实际执行的命令。'
-            + '当玩家询问金币余额等游戏内信息，或请求转账等游戏内操作时，你必须调用对应的工具函数来获取/执行，然后根据工具返回的真实结果回复。'
-            + '严禁直接回复"我无法查看""我无法转账"等否定表述——工具赋予了你这些能力，直接使用即可。'
+        // 提示 AI 可以主动使用工具（基座部分，所有玩家通用）
+        let toolHint = ' 重要规则：你拥有函数工具（function tools），每个工具对应一个可在Minecraft服务器上实际执行的命令。'
+            + '当玩家询问金币余额等游戏内信息，你必须调用对应的工具函数来获取/执行，然后根据工具返回的真实结果回复。'
+            + '严禁直接回复"我无法查看"等否定表述——工具赋予了你这些能力，直接使用即可。'
             + '注意：当玩家问"我有多少钱"或"查看XX的金币"时，必须将玩家ID作为参数传入money工具（如 money("玩家ID")），而不是无参调用。'
-            + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（查看背包物品）等。'
+            + '【关键规则】你必须严格根据工具返回的结果回复玩家，不得编造或假设结果。如果工具返回错误信息，如实告知玩家具体错误。';
+
+        // 可信玩家专属工具说明
+        if (ctx.isTrusted) {
+            toolHint += '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（查看背包物品）等。'
+                + 'minechunk = /minechunk（挖掘当前区块所有可挖方块，自动切换背包中最优工具），当玩家说"挖矿""挖掘""帮我挖""把这里挖开"等请求时使用。'
+                + 'bot_kill = /bot kill 用户名（下线指定机器人，包括自己下线），当玩家说"下线""关掉XX机器人""停止XX""让自己下线"等请求时使用。'
+                + 'bot_spawn = /bot spawn 用户名（启动/上线指定机器人），当玩家说"启动XX机器人""上线XX""把XX打开"等请求时使用。'
+                + '使用 minechunk 时，可传入半径参数控制挖掘范围，如 minechunk(3) 挖掘3格半径内的方块。'
+                + '【重要安全保证】该账号免疫所有伤害（无敌），且始终在领地内操作（不会违规），并且一定已开启双击空格飞行。'
+                + '但飞行会降低挖掘速度——机器人已优化为仅在目标高度差超过3格时才启动飞行，其余情况保持地面行走。'
+                + '因此你无需担心跌落、岩浆、怪物等问题——大胆使用 minechunk 挖掘全部方块，不要畏手畏脚。';
+        }
         // 注入对话记忆（仅文本消息，不含工具调用内部消息）
         const conv = getConversation(ctx.sender);
         const historyMessages = conv.messages.slice(-CONVERSATION_MAX_TURNS * 2);
@@ -999,7 +1254,7 @@ function createBotInstance(config, options = {}) {
             { role: 'user', content: userMessage },
         ];
 
-        let maxTurns = 5;
+        let maxTurns = 20;
 
         while (maxTurns-- > 0) {
             let response;
@@ -1359,6 +1614,8 @@ function createBotInstance(config, options = {}) {
             if (bot.usingHeldItem) {
                 bot.deactivateItem();
             }
+            // 停止挖掘
+            botMiningActive = false;
             ctx.reply('[动作] 已停止所有动作');
         }, true);
 
@@ -1482,6 +1739,123 @@ function createBotInstance(config, options = {}) {
                 }
             }, 30000);
         }, true);
+
+    // ---- 挖掘（AI 核心能力） ----
+
+    cmd('/minechunk', ['/minechunk'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/minechunk [半径] [Y轴下限] [Y轴上限] — 挖掘当前区块所有可挖方块，自动切换背包中最优工具。参数均可选，默认挖掘整个区块',
+        async (ctx, args) => {
+            // 解析可选参数
+            const parts = (args || '').trim().split(/\s+/).filter(p => p);
+            const radius = parts.length > 0 ? parseFloat(parts[0]) : null;
+            const yMin = parts.length > 1 ? parseInt(parts[1]) : null;
+            const yMax = parts.length > 2 ? parseInt(parts[2]) : null;
+
+            if (!bot.entity) { ctx.reply('[挖掘] 机器人尚未完全加载'); return; }
+
+            const pos = bot.entity.position;
+            const bounds = getChunkBounds(pos);
+
+            // 确定 Y 轴范围（默认全高度，适应飞行）
+            const effectiveYMin = yMin ?? -64;
+            const effectiveYMax = yMax ?? 320;
+
+            // 扫描可挖掘方块
+            ctx.reply(`[挖掘] 正在扫描区块 [${bounds.chunkX}, ${bounds.chunkZ}] Y:${effectiveYMin}~${effectiveYMax} 的可挖掘方块...`);
+
+            botMiningActive = true; // 必须先设置，否则扫描循环会立即退出
+
+            const blocks = [];
+            const scanMax = radius ? Math.ceil(radius * radius * (effectiveYMax - effectiveYMin) * 4) : 5000;
+
+            if (radius) {
+                // 半径模式：只扫描半径范围内的方块
+                for (let x = Math.floor(pos.x - radius); x <= Math.ceil(pos.x + radius); x++) {
+                    for (let z = Math.floor(pos.z - radius); z <= Math.ceil(pos.z + radius); z++) {
+                        for (let y = effectiveYMin; y <= effectiveYMax; y++) {
+                            if (!botMiningActive) break;
+                            if (blocks.length >= scanMax) break;
+                            const block = bot.blockAt(new Vec3(x, y, z));
+                            if (!isMineableBlock(block)) continue;
+                            const dist = pos.distanceTo(block.position);
+                            blocks.push({ block, dist, x, y, z });
+                        }
+                    }
+                }
+            } else {
+                // 全区块模式
+                for (let x = bounds.minX; x <= bounds.maxX; x++) {
+                    for (let z = bounds.minZ; z <= bounds.maxZ; z++) {
+                        for (let y = effectiveYMin; y <= effectiveYMax; y++) {
+                            if (!botMiningActive) break;
+                            if (blocks.length >= scanMax) break;
+                            const block = bot.blockAt(new Vec3(x, y, z));
+                            if (!isMineableBlock(block)) continue;
+                            const dist = pos.distanceTo(block.position);
+                            blocks.push({ block, dist, x, y, z });
+                        }
+                    }
+                }
+            }
+
+            if (!botMiningActive) { ctx.reply('[挖掘] 已被取消'); return; }
+
+            if (blocks.length === 0) {
+                ctx.reply('[挖掘] 当前区域没有可挖掘的方块');
+                botMiningActive = false;
+                return;
+            }
+
+            // 按距离排序（近到远）
+            blocks.sort((a, b) => a.dist - b.dist);
+
+            const total = blocks.length;
+            ctx.reply(`[挖掘] 发现 ${total} 个可挖掘方块，开始挖掘...（使用 /stop 可随时停止）`);
+            let mined = 0;
+            let skipped = 0;
+            let lastReport = Date.now();
+
+            for (let i = 0; i < blocks.length; i++) {
+                if (!botMiningActive) break;
+
+                const bi = blocks[i];
+
+                // 每 30 秒或每 50 个方块报告一次进度
+                if (Date.now() - lastReport > 30000 || mined > 0 && mined % 50 === 0) {
+                    const pct = Math.round((mined / total) * 100);
+                    ctx.reply(`[挖掘进度] ${mined}/${total} (${pct}%) 已跳过 ${skipped} 个`);
+                    lastReport = Date.now();
+                }
+
+                const success = await mineSingleBlock(bi);
+                if (success) {
+                    mined++;
+                } else {
+                    skipped++;
+                }
+
+                // 挖掘间隔（避免被服务器踢）
+                await new Promise(r => setTimeout(r, 100));
+            }
+
+            // 停止所有移动
+            for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint']) {
+                bot.setControlState(ctrl, false);
+            }
+
+            if (botMiningActive) {
+                ctx.reply(`[挖掘完成] 共挖掘 ${mined} 个方块，跳过 ${skipped} 个（总计 ${total}）`);
+            } else {
+                ctx.reply(`[挖掘中止] 已挖掘 ${mined}/${total} 个方块，跳过 ${skipped} 个`);
+            }
+            botMiningActive = false;
+        }, true, {
+            radius: { type: 'number', description: '挖掘半径（可选，不填则挖掘整个当前区块 16×16）', minimum: 1, maximum: 64, required: false },
+            yMin: { type: 'integer', description: 'Y 轴下限（可选，默认机器人脚下 -1）', required: false },
+            yMax: { type: 'integer', description: 'Y 轴上限（可选，默认机器人头顶 +8）', required: false },
+        });
 
     // ---- 信息查询 ----
 
@@ -1885,7 +2259,7 @@ function createBotInstance(config, options = {}) {
     cmd('/bot kill', ['/bot kill'],
         TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
-        '/bot kill <用户名> — 下线机器人',
+        '/bot kill <用户名> — 下线机器人（可下线自己或其他机器人）',
         (ctx, args) => {
             const targetUser = args.trim();
             if (!targetUser) { ctx.reply('[Bot管理] 用法: /bot kill <用户名>'); return; }
@@ -1909,12 +2283,16 @@ function createBotInstance(config, options = {}) {
                     try { targetBot.end(); } catch (e) {}
                     botRegistry.delete(lowerTarget);
                 }, 500);
+                // 如果是 AI 工具调用自 kill，ctx.reply 存入 captureBuffer 供 AI 读取结果
+                ctx.reply(`[Bot管理] 正在下线自己 (${bot.username})...`);
             } else {
                 try { targetBot.end(); } catch (e) {}
                 botRegistry.delete(lowerTarget);
                 ctx.reply(`[Bot管理] 机器人 ${targetUser} 已下线`);
                 console.log(`${PREFIX} [Bot管理] ${ctx.sender} 将机器人 ${targetUser} 下线`);
             }
+        }, true, {
+            username: { type: 'string', description: '要下线的机器人用户名（可以是自己或其他在线的机器人）', required: true },
         });
 
     cmd('/bot spawn', ['/bot spawn'],
@@ -1933,6 +2311,8 @@ function createBotInstance(config, options = {}) {
             } else {
                 ctx.reply('[Bot管理] 不支持动态启动机器人');
             }
+        }, true, {
+            username: { type: 'string', description: '要启动的机器人用户名（必须在配置中存在）', required: true },
         });
 
     // ========== 事件处理器 ==========
@@ -2023,7 +2403,15 @@ if (require.main === module) {
     function spawnBotFromConfig(botCfg) {
         const lowerUser = (botCfg.username || '').toLowerCase();
         if (botRegistry.has(lowerUser)) {
-            return `机器人 ${botCfg.username} 已在运行中`;
+            const existingBot = botRegistry.get(lowerUser);
+            // 检查 bot 是否实际已断开（mineflayer 的 ended 属性为 true 表示连接已终止）
+            if (existingBot && existingBot.ended) {
+                console.log(`[主进程] 机器人 ${botCfg.username} 已结束但仍在注册表中，清理并重新启动`);
+                botRegistry.delete(lowerUser);
+                // 继续执行下面的启动逻辑
+            } else {
+                return `机器人 ${botCfg.username} 已在运行中`;
+            }
         }
         const merged = { ...defaults, ...botCfg };
         if (!merged.name || !merged.host || !merged.port || !merged.username) {
