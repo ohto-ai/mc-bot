@@ -798,7 +798,7 @@ function createBotInstance(config, options = {}) {
     // ---- 物品栏 / 快捷栏 ----
 
     cmd('/inv', ['/inv', '/inventory'],
-        TRIGGER.WHISPER | TRIGGER.WEB,
+        TRIGGER.WHISPER | TRIGGER.WEB | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/inv — 查看物品栏',
         (ctx) => {
@@ -951,7 +951,7 @@ function createBotInstance(config, options = {}) {
     // ---- 信息查询 ----
 
     cmd('/nearby', ['/nearby'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/nearby — 查看附近实体（玩家 & 生物）',
         (ctx) => {
@@ -1054,7 +1054,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/trust add', ['/trust add'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/trust add <玩家名> — 添加信任玩家',
         (ctx, args) => {
@@ -1071,7 +1071,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/trust remove', ['/trust remove'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/trust remove <玩家名> — 移除信任玩家',
         (ctx, args) => {
@@ -1156,7 +1156,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot kill', ['/bot kill'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/bot kill <用户名> — 下线机器人',
         (ctx, args) => {
@@ -1191,7 +1191,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot spawn', ['/bot spawn'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/bot spawn <用户名> — 上线机器人',
         (ctx, args) => {
