@@ -332,6 +332,8 @@ function createBotInstance(config, options = {}) {
     let botFollowInterval = null;
     let aiCallCount = 0;
     let botMiningActive = false; // 挖掘状态标志（/stop 可终止）
+    let botAttackingActive = false; // 持续攻击状态标志（/stop 可终止）
+    let botAttackLoopInterval = null;
     let autoServerSwitchDone = false; // 防止重复自动切换服务器
     let autoClickTarget = null; // { serverName, resolve, reject, timer } — 自动点击菜单中的服务器物品
 
@@ -1391,6 +1393,7 @@ function createBotInstance(config, options = {}) {
                 + 'bot_spawn = /bot spawn 用户名（启动/上线指定机器人），当玩家说"启动XX机器人""上线XX""把XX打开"等请求时使用。'
                 + 'server = /server 服务器名（通过菜单切换到指定子服，支持模糊匹配如"主服""S1""S3"），当玩家说"去XX服""切换到XX""换服""去主服/S1/S3"等请求时使用。'
                 + '使用 minechunk 时，可传入半径参数控制挖掘范围，如 minechunk(3) 挖掘3格半径内的方块。'
+                + 'attackloop = /attackloop [实体名] [范围]（持续攻击，默认攻击所有敌对生物，范围6格），当玩家说"挂机攻击""帮我清怪""刷袭击""打猪灵"等请求时使用。使用 /stop 停止。'
                 + '【重要安全保证】该账号免疫所有伤害（无敌），且始终在领地内操作（不会违规），并且一定已开启双击空格飞行。'
                 + '但飞行会降低挖掘速度——机器人已优化为仅在目标高度差超过3格时才启动飞行，其余情况保持地面行走。'
                 + '因此你无需担心跌落、岩浆、怪物等问题——大胆使用 minechunk 挖掘全部方块，不要畏手畏脚。';
@@ -1686,6 +1689,27 @@ function createBotInstance(config, options = {}) {
 
     // ---- 攻击 ----
 
+    // 判断实体是否为敌对生物（兼容 kind=hostile 和 type=mob 但名称匹配的情况）
+    const HOSTILE_NAME_PATTERNS = [
+        'zombie', 'skeleton', 'creeper', 'spider', 'witch',
+        'pillager', 'evoker', 'vindicator', 'ravager', 'vex', 'illusioner',
+        'phantom', 'drowned', 'husk', 'stray', 'wither_skeleton',
+        'blaze', 'ghast', 'magma_cube', 'slime',
+        'enderman', 'endermite', 'silverfish', 'cave_spider',
+        'guardian', 'elder_guardian', 'shulker',
+        'hoglin', 'piglin', 'piglin_brute', 'zoglin',
+        'warden', 'breeze', 'bogged',
+        'raid', 'raider',
+    ];
+
+    function isHostileMob(entity) {
+        if (!entity || !entity.name) return false;
+        if (entity.kind === 'hostile') return true;
+        if (entity.type !== 'mob') return false;
+        const name = (entity.name || '').toLowerCase();
+        return HOSTILE_NAME_PATTERNS.some(p => name.includes(p));
+    }
+
     cmd('/attack', ['/attack'],
         TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
@@ -1697,7 +1721,7 @@ function createBotInstance(config, options = {}) {
                 target = bot.nearestEntity(e => e.name && e.name.toLowerCase().includes(targetName));
                 if (!target) { ctx.reply(`[攻击] 附近没有找到 "${args}"`); return; }
             } else {
-                target = bot.nearestEntity(e => e.kind === 'hostile');
+                target = bot.nearestEntity(e => isHostileMob(e));
                 if (!target) { ctx.reply('[攻击] 附近没有敌对生物'); return; }
             }
             try {
@@ -1708,6 +1732,135 @@ function createBotInstance(config, options = {}) {
             }
         }, true, {
             entityName: { type: 'string', description: '要攻击的实体名称（可选，不填则攻击最近敌对生物）', required: false },
+        });
+
+    cmd('/attackloop', ['/attackloop'],
+        TRIGGER.WEB | TRIGGER.WHISPER,
+        TARGET.TRUSTED,
+        '/attackloop <实体名列表> [范围] — 持续攻击。多个实体名用 / 分隔，如 pillager/evoker/witch。使用 /stop 停止',
+        (ctx, args) => {
+            if (!bot.entity) { ctx.reply('[持续攻击] 机器人尚未完全加载'); return; }
+
+            // 停止已有的攻击循环
+            if (botAttackLoopInterval) {
+                clearInterval(botAttackLoopInterval);
+                botAttackLoopInterval = null;
+            }
+
+            const trimmed = (args || '').trim();
+            if (!trimmed) { ctx.reply('[持续攻击] 必须指定至少一个实体名（多个用 / 分隔，如 pillager/evoker/witch）'); return; }
+
+            const parts = trimmed.split(/\s+/).filter(p => p);
+            // 最后一个参数如果是纯数字则当作范围
+            const rangeStr = parts.length > 1 && /^\d+(\.\d+)?$/.test(parts[parts.length - 1])
+                ? parts.pop() : '6';
+            // 剩下的合并后用 / 拆分为多个实体名
+            const nameStr = parts.join(' ');
+            const rawNames = nameStr.split('/').map(s => s.trim().toLowerCase()).filter(s => s);
+            const scanRange = parseFloat(rangeStr) || 6;
+
+            // @e 表示攻击范围内所有非玩家实体
+            const useAtE = rawNames.includes('@e');
+            const targetNames = useAtE ? [] : rawNames;
+
+            botAttackingActive = true;
+            let attackCount = 0;
+            let lastReport = Date.now();
+
+            ctx.reply(useAtE
+                ? `[持续攻击] 目标: @e（范围内所有非玩家实体，范围 ${scanRange}m），使用 /stop 停止`
+                : `[持续攻击] 目标: ${targetNames.join('/')}（范围 ${scanRange}m），使用 /stop 停止`);
+
+            // 检查实体是否为有效攻击目标
+            const ATTACKABLE_TYPES = ['mob', 'hostile', 'player'];
+
+            function isValidTarget(entity) {
+                if (!entity || !entity.position) return false;
+                // 排除无效/非攻击实体：物品、经验球、画、船、矿车等
+                if (!entity.name) return false;
+                if (entity.name === 'item' || entity.name === 'experience_orb' ||
+                    entity.name === 'arrow' || entity.name === 'painting' ||
+                    entity.name === 'item_frame' || entity.name === 'glow_item_frame' ||
+                    entity.name === 'boat' || entity.name === 'chest_boat' ||
+                    entity.name === 'minecart' || entity.name === 'chest_minecart' ||
+                    entity.name === 'area_effect_cloud' || entity.name === 'marker') return false;
+                return true;
+            }
+
+            function nameMatches(entity, lowerNames) {
+                if (useAtE) {
+                    // @e 模式：攻击范围内所有可攻击的实体，排除玩家和机器人自己
+                    if (entity.type === 'player' || entity.username === bot.username) return false;
+                    if (!ATTACKABLE_TYPES.includes(entity.type) && entity.type !== 'object') return false;
+                    // entity.type 'object' 中的有效目标（如 falling_block, tnt 不算）
+                    if (entity.type === 'object' && entity.name !== 'falling_block' && entity.name !== 'tnt') return false;
+                    return true;
+                }
+                const name = (entity.name || '').toLowerCase();
+                const displayName = (typeof entity.displayName === 'string'
+                    ? entity.displayName : (entity.displayName ? JSON.stringify(entity.displayName) : '')).toLowerCase();
+                const customName = (typeof entity.customName === 'string'
+                    ? entity.customName : (entity.customName ? JSON.stringify(entity.customName) : '')).toLowerCase();
+                return lowerNames.some(kw =>
+                    name.includes(kw) || displayName.includes(kw) || customName.includes(kw)
+                );
+            }
+
+            botAttackLoopInterval = setInterval(() => {
+                if (!botAttackingActive) {
+                    clearInterval(botAttackLoopInterval);
+                    botAttackLoopInterval = null;
+                    return;
+                }
+
+                const pos = bot.entity.position;
+                if (!pos) return;
+
+                // 在范围内查找所有匹配实体，选最近的
+                let bestTarget = null;
+                let bestDist = Infinity;
+                for (const entity of Object.values(bot.entities)) {
+                    if (!isValidTarget(entity)) continue;
+                    const dist = pos.distanceTo(entity.position);
+                    if (dist > scanRange) continue;
+                    if (dist >= bestDist) continue;
+                    if (nameMatches(entity, targetNames)) {
+                        bestDist = dist;
+                        bestTarget = entity;
+                    }
+                }
+
+                if (!bestTarget) return; // 范围内无匹配目标，静默等待
+
+                // 再次验证目标仍然存在且有效（防止攻击已消失的实体）
+                try {
+                    const refreshed = bot.entities[bestTarget.id || bestTarget.uuid];
+                    if (!refreshed || !refreshed.position) return;
+                } catch (e) {
+                    return; // 实体已消失
+                }
+
+                try {
+                    // 看向目标并攻击
+                    bot.lookAt(bestTarget.position.offset(0, bestTarget.height ? bestTarget.height * 0.5 : 1, 0), true);
+                    bot.attack(bestTarget);
+                    attackCount++;
+
+                    // 每 30 秒或每 50 次攻击汇报一次
+                    if (Date.now() - lastReport > 30000 || attackCount % 50 === 0) {
+                        const targetName = bestTarget.displayName || bestTarget.name || '(未知)';
+                        if (ctx.type === 'whisper') {
+                            safeWhisper(ctx.sender, `[持续攻击进度] 已攻击 ${attackCount} 次，当前目标: ${targetName}`);
+                        }
+                        lastReport = Date.now();
+                    }
+                } catch (err) {
+                    // 攻击失败静默跳过（如目标死亡或距离过远）
+                }
+            }, 300); // 每 300ms 尝试一次攻击
+        }, true, {
+            names: { type: 'string', description: '要攻击的实体名列表，多个用 / 分隔，如 pillager/evoker/vindicator/witch/ravager/vex', required: true },
+            range: { type: 'number', description: '扫描范围（可选，默认6格）', minimum: 1, maximum: 30, required: false },
         });
 
     // ---- 物品使用 ----
@@ -1774,6 +1927,12 @@ function createBotInstance(config, options = {}) {
             }
             // 停止挖掘
             botMiningActive = false;
+            // 停止持续攻击
+            botAttackingActive = false;
+            if (botAttackLoopInterval) {
+                clearInterval(botAttackLoopInterval);
+                botAttackLoopInterval = null;
+            }
             ctx.reply('[动作] 已停止所有动作');
         }, true);
 
@@ -2035,8 +2194,11 @@ function createBotInstance(config, options = {}) {
                 });
             }
 
+            // minecraft-data 中不同类型实体的 type 字段不一致：
+            // 潜影贝是 "mob"，但僵尸/末影人等是 "hostile"，动物是 "animal" 等
+            const LIVING_TYPES = ['mob', 'hostile', 'animal', 'passive', 'ambient', 'water_creature', 'living'];
             const mobs = Object.values(bot.entities).filter(e =>
-                e.type === 'mob' && e.name && e.position && pos.distanceTo(e.position) <= 30
+                LIVING_TYPES.includes(e.type) && e.name && e.position && pos.distanceTo(e.position) <= 30
             ).sort((a, b) => pos.distanceTo(a.position) - pos.distanceTo(b.position)).slice(0, 20);
 
             if (mobs.length > 0) {
