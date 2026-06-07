@@ -1806,15 +1806,60 @@ function createBotInstance(config, options = {}) {
                 );
             }
 
-            botAttackLoopInterval = setInterval(() => {
+            // 根据手中物品计算攻击冷却时间
+            function getAttackCooldown() {
+                const item = bot.heldItem;
+                if (!item) return 650; // 空手默认按剑级冷却
+                const name = (item.name || '').toLowerCase();
+
+                // 剑 — 攻速 1.6 → 625ms
+                if (name.includes('sword')) return 650;
+
+                // 斧 — 钻石/铁 1.0 → 1s，石/木/金 0.8 → 1.25s
+                if (name.includes('_axe') || name.includes('axe')) {
+                    if (name.includes('diamond') || name.includes('iron') || name.includes('netherite')) return 1100;
+                    return 1300;
+                }
+
+                // 镐 — 1.2 → 833ms
+                if (name.includes('pickaxe')) return 850;
+
+                // 铲 — 1.0 → 1s
+                if (name.includes('shovel') || name.includes('spade')) return 1000;
+
+                // 锄 — 不同版本差异大，取安全值
+                if (name.includes('_hoe') || name.includes('hoe')) return 1000;
+
+                // 三叉戟 — 1.1 → 909ms
+                if (name.includes('trident')) return 950;
+
+                // 锤（重锤）— 0.6 → 1.67s
+                if (name.includes('mace')) return 1700;
+
+                return 650;
+            }
+
+            let attackCooldown = getAttackCooldown();
+            let lastAttackTime = 0;
+
+            function attackLoop() {
                 if (!botAttackingActive) {
-                    clearInterval(botAttackLoopInterval);
                     botAttackLoopInterval = null;
                     return;
                 }
 
+                // 检查手持物品是否变化，更新冷却时间
+                const cd = getAttackCooldown();
+                if (cd !== attackCooldown) {
+                    attackCooldown = cd;
+                    console.log(`${PREFIX} [攻击] 武器切换，攻击冷却调整为 ${cd}ms`);
+                }
+
                 const pos = bot.entity.position;
-                if (!pos) return;
+                if (!pos) {
+                    botAttackLoopInterval = setTimeout(attackLoop, 200);
+                    return;
+                }
 
                 // 在范围内查找所有匹配实体，选最近的
                 let bestTarget = null;
@@ -1830,20 +1875,38 @@ function createBotInstance(config, options = {}) {
                     }
                 }
 
-                if (!bestTarget) return; // 范围内无匹配目标，静默等待
+                if (!bestTarget) {
+                    // 无目标，快速扫描
+                    botAttackLoopInterval = setTimeout(attackLoop, 200);
+                    return;
+                }
+
+                // 检查冷却是否就绪
+                const now = Date.now();
+                const elapsed = now - lastAttackTime;
+                if (elapsed < attackCooldown) {
+                    // 冷却中，看目标但不攻击
+                    botAttackLoopInterval = setTimeout(attackLoop, Math.max(50, attackCooldown - elapsed));
+                    return;
+                }
 
                 // 再次验证目标仍然存在且有效（防止攻击已消失的实体）
                 try {
                     const refreshed = bot.entities[bestTarget.id || bestTarget.uuid];
-                    if (!refreshed || !refreshed.position) return;
+                    if (!refreshed || !refreshed.position) {
+                        botAttackLoopInterval = setTimeout(attackLoop, 200);
+                        return;
+                    }
                 } catch (e) {
-                    return; // 实体已消失
+                    botAttackLoopInterval = setTimeout(attackLoop, 200);
+                    return;
                 }
 
                 try {
                     // 看向目标并攻击
                     bot.lookAt(bestTarget.position.offset(0, bestTarget.height ? bestTarget.height * 0.5 : 1, 0), true);
                     bot.attack(bestTarget);
+                    lastAttackTime = Date.now();
                     attackCount++;
 
                     // 每 30 秒或每 50 次攻击汇报一次
@@ -1855,9 +1918,15 @@ function createBotInstance(config, options = {}) {
                         lastReport = Date.now();
                     }
                 } catch (err) {
-                    // 攻击失败静默跳过（如目标死亡或距离过远）
+                    // 攻击失败静默跳过
                 }
-            }, 300); // 每 300ms 尝试一次攻击
+
+                // 按冷却时间调度下一次攻击
+                botAttackLoopInterval = setTimeout(attackLoop, Math.max(50, attackCooldown - (Date.now() - lastAttackTime)));
+            }
+
+            // 启动攻击循环
+            botAttackLoopInterval = setTimeout(attackLoop, 100);
         }, true, {
             names: { type: 'string', description: '要攻击的实体名列表，多个用 / 分隔，如 pillager/evoker/vindicator/witch/ravager/vex', required: true },
             range: { type: 'number', description: '扫描范围（可选，默认6格）', minimum: 1, maximum: 30, required: false },
