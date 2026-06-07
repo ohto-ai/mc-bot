@@ -104,6 +104,7 @@ function createBotInstance(config, options = {}) {
         max_msg_len: maxMsgLen,
         auto_menu: autoMenu,
         auto_login: autoLogin,
+        default_server: defaultServer,
         tp_reply: tpReply,
     } = config;
 
@@ -331,6 +332,8 @@ function createBotInstance(config, options = {}) {
     let botFollowInterval = null;
     let aiCallCount = 0;
     let botMiningActive = false; // 挖掘状态标志（/stop 可终止）
+    let autoServerSwitchDone = false; // 防止重复自动切换服务器
+    let autoClickTarget = null; // { serverName, resolve, reject, timer } — 自动点击菜单中的服务器物品
 
     // ========== 挖掘工具匹配系统 ==========
 
@@ -490,8 +493,10 @@ function createBotInstance(config, options = {}) {
     function walkToPosition(targetPos, minDist = 2.5) {
         return new Promise((resolve) => {
             const checkInterval = 150;
+            const lookInterval = 450; // 降低视角更新频率，避免频繁 snap 导致转圈
             const maxTime = 30000;
             const startTime = Date.now();
+            let lastLookTime = 0;
 
             const stopMove = () => {
                 for (const ctrl of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
@@ -517,7 +522,20 @@ function createBotInstance(config, options = {}) {
                     return resolve(false);
                 }
 
-                bot.lookAt(targetPos.offset(0, 0.5, 0), true);
+                // 只在距离较远或方向变化较大时更新视角，避免近距离时频繁转头导致转圈
+                const dx = targetPos.x - myPos.x;
+                const dz = targetPos.z - myPos.z;
+                const horizDist = Math.sqrt(dx * dx + dz * dz);
+                const now = Date.now();
+                if (horizDist > 1.0 && now - lastLookTime > lookInterval) {
+                    // 使用 non-force 模式平滑转头，避免 snap 造成的视角抖动
+                    const lookTarget = targetPos.offset(0, 0.5, 0);
+                    // 避免目标在正上方/正下方时 yaw 无定义导致的旋转
+                    if (horizDist > 0.3) {
+                        bot.lookAt(lookTarget, false);
+                    }
+                    lastLookTime = now;
+                }
 
                 bot.setControlState('forward', true);
                 if (dist > 6) bot.setControlState('sprint', true);
@@ -543,11 +561,24 @@ function createBotInstance(config, options = {}) {
         if (!botMiningActive) return false;
         const { block, x, y, z } = blockInfo;
 
+        // 辅助函数：停止所有移动控制
+        const stopAllMove = () => {
+            for (const ctrl of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+                bot.setControlState(ctrl, false);
+            }
+        };
+
         try {
             // 1. 走到方块附近
             const center = block.position.offset(0.5, 0.5, 0.5);
             const reached = await walkToPosition(center, 4.0);
             if (!reached) return false;
+
+            // 1.5 停止移动，等待身体稳定后再操作（避免走路惯性导致转圈）
+            stopAllMove();
+            await new Promise(r => setTimeout(r, 250));
+
+            if (!botMiningActive) return false;
 
             // 2. 切换最佳工具
             const bestTool = findBestTool(bot, block.name);
@@ -559,14 +590,24 @@ function createBotInstance(config, options = {}) {
                 }
             }
 
-            // 3. 看向方块并挖掘
-            bot.lookAt(center, true);
+            // 3. 看向方块中心（force=true 确保精准对准挖掘目标）
+            const myPos = bot.entity.position;
+            const dx = center.x - myPos.x;
+            const dz = center.z - myPos.z;
+            const horizDist = Math.sqrt(dx * dx + dz * dz);
+            // 只在水平距离足够时调整视角，避免正上方/下方时 yaw 无定义导致转圈
+            if (horizDist > 0.3) {
+                bot.lookAt(center, true);
+            }
+            // horizDist <= 0.3 时跳过 lookAt，保持当前朝向（只差高度，yaw 无关紧要）
             await new Promise(r => setTimeout(r, 300)); // 等待服务器确认视角
 
             if (!botMiningActive) return false;
 
             if (bot.canDigBlock(block)) {
                 await bot.dig(block, true, 'auto');
+                // 挖掘完成后停止移动，避免惯性
+                stopAllMove();
                 return true;
             }
         } catch (err) {
@@ -631,6 +672,12 @@ function createBotInstance(config, options = {}) {
     // ========== 菜单窗口自动化 ==========
     bot.on('windowOpen', (window) => {
         console.log(`${PREFIX} [菜单] 窗口打开 [类型=${window.type}, 槽位数=${window.slots.length}]`);
+
+        // 自动点击目标（服务器切换）→ 最高优先级
+        if (autoClickTarget) {
+            setTimeout(() => autoClickServerItem(window), 500);
+            return;
+        }
 
         if (menuSearch) {
             setTimeout(() => searchMenu(window), 500);
@@ -703,6 +750,102 @@ function createBotInstance(config, options = {}) {
             clearTimeout(pendingConfirm.timer);
             pendingConfirm = null;
         }
+    }
+
+    // 自动点击菜单中的服务器物品（无需确认，用于服务器切换）
+    function autoClickServerItem(window) {
+        const target = autoClickTarget;
+        autoClickTarget = null;
+        clearTimeout(target.timer);
+
+        const endSlot = window.inventoryStart ?? window.slots.length;
+        const lowerName = target.serverName.toLowerCase();
+        let foundSlot = null;
+        let foundName = '';
+
+        // 遍历菜单物品，匹配服务器名称（在 name / displayName / customName 中搜索）
+        for (let slot = 0; slot < endSlot; slot++) {
+            const item = window.slots[slot];
+            if (!item || !item.name) continue;
+
+            const itemName = (item.name || '').toLowerCase();
+            const displayName = (typeof item.displayName === 'string' ? item.displayName : '').toLowerCase();
+            const customName = (typeof item.customName === 'string' ? item.customName : '').toLowerCase();
+
+            // 同时也检查 JSON.stringified 格式的 displayName（去除 JSON 引号和转义）
+            const rawDisplay = item.displayName
+                ? (typeof item.displayName === 'string' ? item.displayName : JSON.stringify(item.displayName)).toLowerCase()
+                : '';
+            const rawCustom = item.customName
+                ? (typeof item.customName === 'string' ? item.customName : JSON.stringify(item.customName)).toLowerCase()
+                : '';
+
+            if (itemName.includes(lowerName) ||
+                displayName.includes(lowerName) ||
+                customName.includes(lowerName) ||
+                rawDisplay.includes(lowerName) ||
+                rawCustom.includes(lowerName)) {
+
+                foundSlot = slot;
+                foundName = item.displayName
+                    ? (typeof item.displayName === 'string' ? item.displayName : JSON.stringify(item.displayName))
+                    : (item.customName
+                        ? (typeof item.customName === 'string' ? item.customName : JSON.stringify(item.customName))
+                        : item.name);
+                break;
+            }
+        }
+
+        if (foundSlot !== null) {
+            console.log(`${PREFIX} [服务器] 菜单中匹配到 "${foundName}" (栏位 ${foundSlot})，自动点击`);
+            // 仿照 clickMenu 的阻断逻辑
+            if (bot.activateItemInterval) {
+                clearInterval(bot.activateItemInterval);
+                bot.activateItemInterval = null;
+            }
+
+            const originalWrite = bot._client.write.bind(bot._client);
+            bot.clickWindow(foundSlot, 0, 0);
+
+            bot._client.write = function (name, params) {
+                if (name === 'use_item' || name === 'arm_animation') {
+                    console.log(`${PREFIX} [阻断] 已拦截: ${name}`);
+                } else {
+                    originalWrite(name, params);
+                }
+            };
+
+            setTimeout(() => {
+                bot._client.write = originalWrite;
+                console.log(`${PREFIX} [菜单] 超时未传送，恢复发包`);
+            }, 5000);
+
+            target.resolve(`[服务器切换] 已切换到: ${foundName}`);
+        } else {
+            console.log(`${PREFIX} [服务器] 菜单中未找到 "${target.serverName}"`);
+            // 列出菜单内容帮助调试
+            for (let slot = 0; slot < endSlot; slot++) {
+                const item = window.slots[slot];
+                if (item && item.name) {
+                    const d = item.displayName ? ` [${JSON.stringify(item.displayName)}]` : '';
+                    console.log(`${PREFIX} [菜单] 栏位 ${slot}: ${item.name}${d}`);
+                }
+            }
+            target.reject(`[服务器切换] 菜单中未找到服务器 "${target.serverName}"`);
+        }
+    }
+
+    // 通过菜单切换服务器（打开 /menu → 自动点击匹配的服务器物品）
+    function switchServer(serverName) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                autoClickTarget = null;
+                reject('[服务器切换] 等待菜单超时（15 秒），请确认服务器在线且菜单可用');
+            }, 15000);
+
+            autoClickTarget = { serverName, resolve, reject, timer };
+            safeChat('/menu');
+        });
     }
 
     let menuItems = [];
@@ -869,6 +1012,20 @@ function createBotInstance(config, options = {}) {
             }, 3000);
         } else if (spawnCount > 1) {
             console.log(`${PREFIX} [重生] 第 ${spawnCount} 次 spawn，跳过菜单（已在生存服）`);
+        }
+
+        // 自动切换到默认服务器（通过菜单点击）
+        if (defaultServer && !autoServerSwitchDone && (menuDone || !autoMenu)) {
+            autoServerSwitchDone = true;
+            setTimeout(async () => {
+                console.log(`${PREFIX} [服务器] 自动切换到默认服务器: ${defaultServer}`);
+                try {
+                    const result = await switchServer(defaultServer);
+                    console.log(`${PREFIX} [服务器] ${result}`);
+                } catch (err) {
+                    console.error(`${PREFIX} [服务器] 自动切换失败: ${err}`);
+                }
+            }, 2000);
         }
     });
 
@@ -1232,6 +1389,7 @@ function createBotInstance(config, options = {}) {
                 + 'minechunk = /minechunk（挖掘当前区块所有可挖方块，自动切换背包中最优工具），当玩家说"挖矿""挖掘""帮我挖""把这里挖开"等请求时使用。'
                 + 'bot_kill = /bot kill 用户名（下线指定机器人，包括自己下线），当玩家说"下线""关掉XX机器人""停止XX""让自己下线"等请求时使用。'
                 + 'bot_spawn = /bot spawn 用户名（启动/上线指定机器人），当玩家说"启动XX机器人""上线XX""把XX打开"等请求时使用。'
+                + 'server = /server 服务器名（通过菜单切换到指定子服，支持模糊匹配如"主服""S1""S3"），当玩家说"去XX服""切换到XX""换服""去主服/S1/S3"等请求时使用。'
                 + '使用 minechunk 时，可传入半径参数控制挖掘范围，如 minechunk(3) 挖掘3格半径内的方块。'
                 + '【重要安全保证】该账号免疫所有伤害（无敌），且始终在领地内操作（不会违规），并且一定已开启双击空格飞行。'
                 + '但飞行会降低挖掘速度——机器人已优化为仅在目标高度差超过3格时才启动飞行，其余情况保持地面行走。'
@@ -1841,7 +1999,7 @@ function createBotInstance(config, options = {}) {
             }
 
             // 停止所有移动
-            for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint']) {
+            for (const ctrl of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
                 bot.setControlState(ctrl, false);
             }
 
@@ -2085,6 +2243,26 @@ function createBotInstance(config, options = {}) {
             startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat('/tpaccept');
         }, true);
+
+    // ---- 服务器切换 ----
+
+    cmd('/server', ['/server'],
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/server <服务器名> — 通过菜单切换到指定子服（匹配菜单物品名，如"主服""S1""S3"等）',
+        async (ctx, args) => {
+            const serverName = args.trim();
+            if (!serverName) { ctx.reply('[服务器切换] 用法: /server <服务器名>（支持模糊匹配，如 /server 主服 或 /server S1）'); return; }
+            console.log(`${PREFIX} [服务器] ${ctx.sender} 通过菜单切换服务器: "${serverName}"`);
+            try {
+                const result = await switchServer(serverName);
+                ctx.reply(result);
+            } catch (err) {
+                ctx.reply(typeof err === 'string' ? err : err.message || '[服务器切换] 切换失败');
+            }
+        }, true, {
+            serverName: { type: 'string', description: '目标服务器名称（支持模糊匹配菜单物品名，如"主服""S1""S3"等）', required: true },
+        });
 
     // ---- 菜单操作 ----
 
