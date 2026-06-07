@@ -80,9 +80,22 @@ function bindEvents() {
         if (confirm('确定要退出登录吗？')) logout();
     });
 
-    // ESC 关闭弹窗
+    // 设置抽屉
+    $('#settingsBtn').addEventListener('click', openSettings);
+    $('#settingsCloseBtn').addEventListener('click', closeSettings);
+    $('#settingsOverlay').addEventListener('click', (e) => {
+        if (e.target === $('#settingsOverlay')) closeSettings();
+    });
+
+    // ESC 关闭弹窗 / 设置抽屉
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') closeCmdModal();
+        if (e.key === 'Escape') {
+            if ($('#settingsOverlay').style.display === 'flex') {
+                closeSettings();
+            } else {
+                closeCmdModal();
+            }
+        }
     });
 
     // 指令输入框回车发送
@@ -410,4 +423,323 @@ function escHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+// ========== 设置抽屉 ==========
+let settingsConfig = null;
+
+async function openSettings() {
+    try {
+        settingsConfig = await apiCall('GET', '/api/config');
+    } catch (err) {
+        alert('获取配置失败: ' + err.message);
+        return;
+    }
+    renderSettingsForm(settingsConfig);
+    $('#settingsOverlay').style.display = 'flex';
+}
+
+function closeSettings() {
+    $('#settingsOverlay').style.display = 'none';
+}
+
+function renderSettingsForm(cfg) {
+    const defaults = cfg.defaults || {};
+    const ai = cfg.ai || {};
+    const webAuth = cfg.web_auth || {};
+
+    $('#settingsBody').innerHTML = `
+        <!-- Web 鉴权 -->
+        <div class="settings-section" id="section-web-auth">
+            <h4>🔒 Web 鉴权</h4>
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" class="form-input" id="cfg-web-username" value="${escHtml(webAuth.username || '')}">
+            </div>
+            <div class="form-group">
+                <label>密码</label>
+                <input type="text" class="form-input" id="cfg-web-password"
+                    placeholder="${escHtml(webAuth.password || '')}"
+                    title="留空则不修改密码">
+            </div>
+            <button class="btn btn-primary btn-save-section" data-section="web_auth">💾 保存鉴权设置</button>
+        </div>
+
+        <!-- AI 配置 -->
+        <div class="settings-section" id="section-ai">
+            <h4>🤖 AI 配置</h4>
+            <div class="form-group">
+                <label>AI 提供商</label>
+                <select class="form-select" id="cfg-ai-provider">
+                    <option value="mimo" ${ai.provider === 'mimo' ? 'selected' : ''}>MiMo</option>
+                    <option value="deepseek" ${ai.provider === 'deepseek' ? 'selected' : ''}>DeepSeek</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>MiMo API Key</label>
+                <input type="text" class="form-input" id="cfg-ai-mimo-key"
+                    placeholder="${escHtml(ai.mimo?.api_key || '')}"
+                    title="留空则不修改 API Key">
+            </div>
+            <div class="form-group">
+                <label>MiMo Region</label>
+                <select class="form-select" id="cfg-ai-mimo-region">
+                    <option value="cn" ${(ai.mimo?.region || '') === 'cn' ? 'selected' : ''}>CN (中国)</option>
+                    <option value="sgp" ${ai.mimo?.region === 'sgp' ? 'selected' : ''}>SGP (新加坡)</option>
+                    <option value="ams" ${ai.mimo?.region === 'ams' ? 'selected' : ''}>AMS (阿姆斯特丹)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>DeepSeek API Key</label>
+                <input type="text" class="form-input" id="cfg-ai-deepseek-key"
+                    placeholder="${escHtml(ai.deepseek?.api_key || '')}"
+                    title="留空则不修改 API Key">
+            </div>
+            <button class="btn btn-primary btn-save-section" data-section="ai">💾 保存 AI 配置</button>
+        </div>
+
+        <!-- 默认设置 -->
+        <div class="settings-section" id="section-defaults">
+            <h4>⚙️ 默认设置</h4>
+            <div class="form-group">
+                <label>Minecraft 版本</label>
+                <input type="text" class="form-input" id="cfg-defaults-version" value="${escHtml(defaults.version || '')}">
+            </div>
+            <div class="form-group">
+                <label>消息队列延迟 (ms)</label>
+                <input type="number" class="form-input" id="cfg-defaults-queue-delay" value="${defaults.queue_delay ?? 1500}">
+            </div>
+            <div class="form-group">
+                <label>最大消息长度</label>
+                <input type="number" class="form-input" id="cfg-defaults-max-msg-len" value="${defaults.max_msg_len ?? 40}">
+            </div>
+            <div class="form-group">
+                <label>最大转账金额</label>
+                <input type="number" class="form-input" id="cfg-defaults-max-pay" value="${defaults.max_pay_amount ?? 100000}">
+            </div>
+            <div class="form-group">
+                <label>默认服务器地址</label>
+                <input type="text" class="form-input" id="cfg-defaults-server" value="${escHtml(defaults.default_server || '')}">
+            </div>
+            <div class="form-group">
+                <label>TP 自动回复</label>
+                <input type="text" class="form-input" id="cfg-defaults-tp-reply" value="${escHtml(defaults.tp_reply || '')}">
+            </div>
+
+            <div class="form-group form-toggle-row">
+                <label>自动菜单</label>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="cfg-defaults-auto-menu" ${defaults.auto_menu !== false ? 'checked' : ''}>
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+            <div class="form-group form-toggle-row">
+                <label>自动登录</label>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="cfg-defaults-auto-login" ${defaults.auto_login !== false ? 'checked' : ''}>
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+
+            <div class="form-group">
+                <label>System Prompt（AI 提示词）</label>
+                <textarea class="form-textarea" id="cfg-defaults-system-prompt" rows="4">${escHtml(defaults.system_prompt || '')}</textarea>
+            </div>
+            <button class="btn btn-primary btn-save-section" data-section="defaults">💾 保存默认设置</button>
+        </div>
+
+        <!-- 可信玩家列表 -->
+        <div class="settings-section" id="section-trusted">
+            <h4>👥 可信玩家列表</h4>
+            <div class="tag-list" id="trustedTagList">
+                ${(defaults.trusted_players || []).map(p => `
+                    <span class="tag-item">
+                        ${escHtml(p)}
+                        <button class="tag-remove" data-player="${escHtml(p)}" title="移除">×</button>
+                    </span>
+                `).join('')}
+            </div>
+            <div class="form-group form-add-row">
+                <input type="text" class="form-input" id="cfg-new-trusted-player" placeholder="输入玩家名...">
+                <button class="btn btn-sm" id="btnAddTrusted">＋ 添加</button>
+            </div>
+            <button class="btn btn-primary btn-save-section" data-section="trusted">💾 保存可信列表</button>
+        </div>
+    `;
+
+    // 绑定保存按钮
+    $('#settingsBody').querySelectorAll('.btn-save-section').forEach(btn => {
+        btn.addEventListener('click', () => saveSettingsSection(btn.dataset.section));
+    });
+
+    // 绑定可信列表操作
+    $('#btnAddTrusted').addEventListener('click', addTrustedPlayer);
+    const newPlayerInput = $('#cfg-new-trusted-player');
+    if (newPlayerInput) {
+        newPlayerInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); addTrustedPlayer(); }
+        });
+    }
+    bindTagRemoveEvents();
+
+    // 绑定回车键在 web_auth password 输入框中
+    const pwInput = $('#cfg-web-password');
+    if (pwInput) {
+        pwInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); saveSettingsSection('web_auth'); }
+        });
+    }
+}
+
+function bindTagRemoveEvents() {
+    $$('.tag-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+            removeTrustedPlayer(btn.dataset.player);
+        });
+    });
+}
+
+function addTrustedPlayer() {
+    const input = $('#cfg-new-trusted-player');
+    if (!input) return;
+    const name = input.value.trim();
+    if (!name) return;
+    // 检查重复
+    const existing = $$('.tag-remove');
+    for (const btn of existing) {
+        if (btn.dataset.player.toLowerCase() === name.toLowerCase()) {
+            alert('该玩家已在可信列表中');
+            return;
+        }
+    }
+    const tagList = $('#trustedTagList');
+    const tag = document.createElement('span');
+    tag.className = 'tag-item';
+    tag.innerHTML = `${escHtml(name)}<button class="tag-remove" data-player="${escHtml(name)}" title="移除">×</button>`;
+    tagList.appendChild(tag);
+    tag.querySelector('.tag-remove').addEventListener('click', () => removeTrustedPlayer(name));
+    input.value = '';
+    input.focus();
+}
+
+function removeTrustedPlayer(name) {
+    const tagList = $('#trustedTagList');
+    const existing = $$('.tag-remove');
+    for (const btn of existing) {
+        if (btn.dataset.player === name) {
+            btn.parentElement.remove();
+            return;
+        }
+    }
+}
+
+async function saveSettingsSection(section) {
+    const body = {};
+
+    switch (section) {
+        case 'web_auth': {
+            body.web_auth = {};
+            const username = $('#cfg-web-username')?.value?.trim();
+            const password = $('#cfg-web-password')?.value?.trim();
+            if (username) body.web_auth.username = username;
+            if (password) body.web_auth.password = password;  // 空则不修改
+            if (Object.keys(body.web_auth).length === 0) {
+                alert('没有需要保存的修改');
+                return;
+            }
+            break;
+        }
+        case 'ai': {
+            body.ai = {
+                provider: $('#cfg-ai-provider')?.value || 'mimo',
+            };
+            const mimoKey = $('#cfg-ai-mimo-key')?.value?.trim();
+            const deepseekKey = $('#cfg-ai-deepseek-key')?.value?.trim();
+            const mimoRegion = $('#cfg-ai-mimo-region')?.value || 'cn';
+
+            body.ai.mimo = { region: mimoRegion };
+            if (mimoKey) body.ai.mimo.api_key = mimoKey;
+            // 不填则不覆盖现有 key
+
+            body.ai.deepseek = {};
+            if (deepseekKey) body.ai.deepseek.api_key = deepseekKey;
+            // 不填则不覆盖现有 key
+            break;
+        }
+        case 'defaults': {
+            const systemPrompt = $('#cfg-defaults-system-prompt')?.value || '';
+            body.defaults = {
+                version: $('#cfg-defaults-version')?.value?.trim() || '1.20.4',
+                queue_delay: parseInt($('#cfg-defaults-queue-delay')?.value) || 1500,
+                max_msg_len: parseInt($('#cfg-defaults-max-msg-len')?.value) || 40,
+                max_pay_amount: parseInt($('#cfg-defaults-max-pay')?.value) || 100000,
+                auto_menu: $('#cfg-defaults-auto-menu')?.checked !== false,
+                auto_login: $('#cfg-defaults-auto-login')?.checked !== false,
+                default_server: $('#cfg-defaults-server')?.value?.trim() || '',
+                tp_reply: $('#cfg-defaults-tp-reply')?.value?.trim() || '',
+                system_prompt: systemPrompt,
+            };
+            break;
+        }
+        case 'trusted': {
+            const players = [];
+            $$('#trustedTagList .tag-remove').forEach(btn => {
+                players.push(btn.dataset.player);
+            });
+            body.defaults = { trusted_players: players };
+            break;
+        }
+        default:
+            return;
+    }
+
+    // 显示保存中状态
+    const saveBtn = $(`.btn-save-section[data-section="${section}"]`);
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = '保存中...';
+    }
+
+    const result = await apiCall('PUT', '/api/config', body);
+
+    if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '💾 保存' + getSectionLabel(section);
+    }
+
+    if (result.error) {
+        alert(`保存失败: ${result.error}`);
+    } else {
+        // 更新本地缓存的 config
+        if (section === 'trusted') {
+            if (!settingsConfig.defaults) settingsConfig.defaults = {};
+            const players = [];
+            $$('#trustedTagList .tag-remove').forEach(btn => players.push(btn.dataset.player));
+            settingsConfig.defaults.trusted_players = players;
+        }
+
+        // 短暂显示成功提示
+        showSaveSuccess(saveBtn);
+    }
+}
+
+function getSectionLabel(section) {
+    const labels = {
+        web_auth: '鉴权设置',
+        ai: 'AI 配置',
+        defaults: '默认设置',
+        trusted: '可信列表',
+    };
+    return labels[section] || '';
+}
+
+function showSaveSuccess(btn) {
+    if (!btn) return;
+    const original = btn.textContent;
+    btn.textContent = '✅ 已保存';
+    btn.classList.add('btn-success');
+    setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('btn-success');
+    }, 2000);
 }

@@ -468,6 +468,79 @@ app.get('/api/logs', (req, res) => {
     res.json(logs.slice(-limit));
 });
 
+// ========== 配置管理 API ==========
+
+function maskApiKey(key) {
+    if (!key || key.length <= 4) return key ? '****' : '';
+    return '*'.repeat(key.length - 4) + key.slice(-4);
+}
+
+function maskPassword(pw) {
+    if (!pw || pw.length <= 2) return pw ? '**' : '';
+    return '*'.repeat(pw.length - 2) + pw.slice(-2);
+}
+
+// 获取完整配置（bots 除外，敏感字段脱敏）
+app.get('/api/config', (req, res) => {
+    const cfg = JSON.parse(JSON.stringify(config));
+    // 脱敏 API keys
+    if (cfg.ai) {
+        if (cfg.ai.deepseek && cfg.ai.deepseek.api_key) {
+            cfg.ai.deepseek.api_key = maskApiKey(cfg.ai.deepseek.api_key);
+        }
+        if (cfg.ai.mimo && cfg.ai.mimo.api_key) {
+            cfg.ai.mimo.api_key = maskApiKey(cfg.ai.mimo.api_key);
+        }
+    }
+    // 脱敏密码
+    if (cfg.web_auth && cfg.web_auth.password) {
+        cfg.web_auth.password = maskPassword(cfg.web_auth.password);
+    }
+    // 移除 bots（由专门的 bot API 管理）
+    delete cfg.bots;
+    res.json(cfg);
+});
+
+// 更新配置（部分合并）
+app.put('/api/config', (req, res) => {
+    const updates = req.body;
+    if (!updates || typeof updates !== 'object') {
+        return res.status(400).json({ error: '请求体必须为 JSON 对象' });
+    }
+    // 禁止通过此接口修改 bots 数组
+    delete updates.bots;
+
+    // 脱敏值过滤：如果值包含 "****" 则为未修改的脱敏字段，跳过
+    function isMasked(val) {
+        return typeof val === 'string' && val.includes('****');
+    }
+
+    // 深度合并辅助函数（跳过脱敏值）
+    function deepMerge(target, source) {
+        for (const key of Object.keys(source)) {
+            const srcVal = source[key];
+            const tgtVal = target[key];
+            if (srcVal && typeof srcVal === 'object' && !Array.isArray(srcVal) &&
+                tgtVal && typeof tgtVal === 'object' && !Array.isArray(tgtVal)) {
+                deepMerge(tgtVal, srcVal);
+            } else if (!isMasked(srcVal)) {
+                target[key] = srcVal;
+            }
+        }
+    }
+
+    deepMerge(config, updates);
+    saveConfig(config);
+
+    // 如果 AI 配置变更，需更新 aiCfg 引用（下次 spawn 生效）
+    const newAiCfg = getAIConfig(config);
+    Object.assign(aiCfg, newAiCfg);
+
+    pushLog('event', 'server', '[配置] Web 面板更新了配置');
+    sendSseStatus();
+    res.json({ success: true, message: '配置已保存' });
+});
+
 // SSE 事件流
 app.get('/api/events', (req, res) => {
     // 优先验证 SSE 短期令牌，其次回退到标准 JWT

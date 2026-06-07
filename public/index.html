@@ -15,6 +15,7 @@
             <span class="connection-status" id="connectionStatus">● 已连接</span>
         </div>
         <div class="header-right">
+            <button class="btn btn-sm" id="settingsBtn" title="系统设置">⚙️ 设置</button>
             <button class="btn btn-sm" id="refreshBtn" title="刷新状态">🔄 刷新</button>
             <button class="btn btn-sm" id="toggleLogsBtn" title="显示/隐藏日志">📋 日志</button>
             <button class="btn btn-sm btn-logout" id="logoutBtn" title="退出登录">🚪 退出</button>
@@ -30,6 +31,19 @@
             </div>
         </section>
     </main>
+
+    <!-- 设置抽屉面板 -->
+    <div class="settings-overlay" id="settingsOverlay" style="display:none;">
+        <div class="settings-drawer" id="settingsDrawer">
+            <div class="drawer-header">
+                <h3>⚙️ 系统设置</h3>
+                <button class="btn-close" id="settingsCloseBtn">&times;</button>
+            </div>
+            <div class="drawer-body" id="settingsBody">
+                <div class="settings-loading">加载中...</div>
+            </div>
+        </div>
+    </div>
 
     <!-- 日志面板（可折叠） -->
     <section class="log-panel" id="logPanel">
