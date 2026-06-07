@@ -355,8 +355,18 @@ function createBotInstance(config, options = {}) {
     // ---- 命令输出捕获 ----
     function flushCmdCapture() {
         if (!cmdCapture) return;
-        const { target, type, messages } = cmdCapture;
+        const { target, type, messages, _capture, _onFlush } = cmdCapture;
         cmdCapture = null;
+
+        function sendOrCapture(reply) {
+            if (_capture) {
+                _capture.push(reply);
+            } else if (type === 'qq_at') {
+                sendQQReply(reply);
+            } else {
+                safeWhisper(target, reply);
+            }
+        }
 
         if (messages.length > 0) {
             const filtered = [...new Set(messages)].filter(m => {
@@ -365,19 +375,16 @@ function createBotInstance(config, options = {}) {
                 return true;
             });
             if (filtered.length > 0) {
-                const reply = `[命令结果]\n${filtered.join('\n')}`;
-                if (type === 'qq_at') sendQQReply(reply);
-                else safeWhisper(target, reply);
+                sendOrCapture(`[命令结果]\n${filtered.join('\n')}`);
             } else {
-                const reply = '[命令结果] (无有效输出)';
-                if (type === 'qq_at') sendQQReply(reply);
-                else safeWhisper(target, reply);
+                sendOrCapture('[命令结果] (无有效输出)');
             }
         } else {
-            const reply = '[命令结果] (无输出)';
-            if (type === 'qq_at') sendQQReply(reply);
-            else safeWhisper(target, reply);
+            sendOrCapture('[命令结果] (无输出)');
         }
+
+        // 通知 executeToolCall 捕获已完成（AI 工具调用用）
+        if (_onFlush) _onFlush();
     }
 
     // ========== 菜单窗口自动化 ==========
@@ -696,7 +703,9 @@ function createBotInstance(config, options = {}) {
     // ========== AI 对话处理 ==========
 
     async function handleAIChat(ctx) {
-        const prompt = ctx.content.trim();
+        // 附上发送者用户名，让 AI 知道是谁在说话（解决「转钱给我」中「我」指代不清的问题）
+        const senderInfo = ctx.sender ? `[来自玩家 ${ctx.sender}] ` : '';
+        const prompt = senderInfo + ctx.content.trim();
         if (!prompt) return;
 
         console.log(`${PREFIX} [AI-${aiProvider}] ${ctx.sender} (${ctx.type}): ${prompt}`);
@@ -722,7 +731,7 @@ function createBotInstance(config, options = {}) {
             target: ctx.sender,
             type: ctx.type,
             messages: [],
-            timer: setTimeout(flushCmdCapture, 1500),
+            timer: setTimeout(flushCmdCapture, 5000),
         };
         safeChat(ctx.content);
     }
@@ -737,6 +746,12 @@ function createBotInstance(config, options = {}) {
         if (!match) return `[错误] 未知命令: ${cmdName}`;
         if (!match.def.toolAllowed) return `[错误] 命令 ${cmdName} 不允许作为工具使用`;
 
+        // 清除旧的捕获状态，避免污染
+        if (cmdCapture) {
+            clearTimeout(cmdCapture.timer);
+            cmdCapture = null;
+        }
+
         const captureBuffer = [];
         const cmdText = args ? `${cmdName} ${args}` : cmdName;
         const toolCtx = createMessageContext('tool', 0, originalCtx.sender, cmdText, originalCtx.isTrusted, captureBuffer);
@@ -744,6 +759,13 @@ function createBotInstance(config, options = {}) {
         try {
             console.log(`${PREFIX} [工具] ${originalCtx.sender} → ${match.def.name} ${args || ''}`);
             await match.def.handler(toolCtx, args || '');
+
+            // 如果 handler 设置了 cmdCapture（表示有异步服务器输出待捕获），等待 flush 完成
+            if (cmdCapture) {
+                await new Promise(resolve => {
+                    cmdCapture._onFlush = resolve;
+                });
+            }
         } catch (err) {
             console.error(`${PREFIX} [工具错误] ${match.def.name}:`, err.message);
             return `[错误] 命令执行失败: ${err.message}`;
@@ -847,7 +869,12 @@ function createBotInstance(config, options = {}) {
 
     async function queryAIWithTools(userMessage, tools, ctx) {
         // 提示 AI 可以主动使用工具
-        const toolHint = ' 你可以使用提供的函数工具来获取实时信息或执行Minecraft游戏内操作。当用户询问需要查看或操作游戏内容的问题时，请主动调用合适的工具。';
+        // 强制工具使用提示：明确告知 AI 它有能力执行 Minecraft 服务器命令
+        const toolHint = ' 重要规则：你拥有函数工具（function tools），每个工具对应一个可在Minecraft服务器上实际执行的命令。'
+            + '当玩家询问金币余额等游戏内信息，或请求转账等游戏内操作时，你必须调用对应的工具函数来获取/执行，然后根据工具返回的真实结果回复。'
+            + '严禁直接回复"我无法查看""我无法转账"等否定表述——工具赋予了你这些能力，直接使用即可。'
+            + '注意：当玩家问"我有多少钱"或"查看XX的金币"时，必须将玩家ID作为参数传入money工具（如 money("玩家ID")），而不是无参调用。'
+            + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（看背包）等。';
         const messages = [
             { role: 'system', content: systemPrompt + toolHint },
             { role: 'user', content: userMessage },
@@ -1200,6 +1227,47 @@ function createBotInstance(config, options = {}) {
             }
 
             ctx.reply(lines.length === 0 ? '[附近] 附近没有实体' : `[附近]\n${lines.join('\n')}`);
+        }, true);
+
+    // ---- 经济系统 ----
+
+    cmd('/money', ['/money'],
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.ALL,
+        '/money [玩家名] — 查看金币数量（不填则查 bot 自己的余额）',
+        (ctx, args) => {
+            const target = args.trim();
+            const cmdText = target ? `/money ${target}` : '/money';
+            console.log(`${PREFIX} [经济] ${ctx.sender} 查询金币${target ? ' (目标: ' + target + ')' : ''}`);
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [],
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat(cmdText);
+        }, true);
+
+    cmd('/pay', ['/pay'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/pay <玩家名> <金额> — 转账金币给指定玩家',
+        (ctx, args) => {
+            const parts = args.trim().split(/\s+/);
+            if (parts.length < 2) { ctx.reply('[转账] 用法: /pay <玩家名> <金额>'); return; }
+            const target = parts[0];
+            const amount = parseInt(parts[1]);
+            if (isNaN(amount) || amount <= 0) { ctx.reply('[转账] 金额必须为正整数'); return; }
+            console.log(`${PREFIX} [经济] ${ctx.sender} 转账 ${amount} 金币给 ${target}`);
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [],
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat(`/pay ${target} ${amount}`);
         }, true);
 
     // ---- 菜单操作 ----

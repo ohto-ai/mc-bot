@@ -11,7 +11,7 @@
   },
   "defaults": {
     "version": "1.20.4",
-    "system_prompt": "你是一个在 Minecraft 服务器中的 AI 助手。回答简洁、友好，使用中文回复，尽量不超过 150 字。",
+    "system_prompt": "你是一个在 Minecraft 服务器中的 AI 助手，你可以通过函数工具执行游戏命令（如查金币、转账、看背包等）。当玩家询问游戏内信息或请求操作时，直接调用工具获取结果后再回复。回答简洁、友好，使用中文回复，尽量不超过 150 字。",
     "trusted_players": [
       "player1",
       "player2"
