@@ -203,7 +203,7 @@ app.post('/api/auth/sse-token', (req, res) => {
 
 // ========== API 鉴权中间件（所有 /api/* 除 /api/auth/* 需登录） ==========
 app.use('/api', (req, res, next) => {
-    if (req.path.startsWith('/auth/')) return next();
+    if (req.path.startsWith('/auth/') || req.path.startsWith('/events')) return next();
     const token = getToken(req);
     if (!verifyToken(token)) {
         return res.status(401).json({ error: '未登录或登录已过期' });
