@@ -251,6 +251,27 @@ function createBotInstance(config, options = {}) {
         setTimeout(() => processQueue(), queueDelay);
     }
 
+    // ---- Markdown 格式清洗（去掉聊天窗里不好看的星号等标记） ----
+    function stripMarkdown(text) {
+        if (!text) return text;
+        let result = text;
+        // 粗体+斜体 (***text***)
+        result = result.replace(/\*\*\*(.+?)\*\*\*/g, '$1');
+        // 粗体 (**text** 或 __text__)
+        result = result.replace(/\*\*(.+?)\*\*/g, '$1');
+        result = result.replace(/__(.+?)__/g, '$1');
+        // 斜体 (*text* 或 _text_) — 用 \B 避免误伤列表符号 "* item"
+        result = result.replace(/\B\*([^*\n]+?)\*\B/g, '$1');
+        result = result.replace(/\B_([^_\n]+?)_\B/g, '$1');
+        // 删除线 (~~text~~)
+        result = result.replace(/~~(.+?)~~/g, '$1');
+        // 行内代码 (`text`)
+        result = result.replace(/`([^`\n]+?)`/g, '$1');
+        // 链接 [text](url) → text
+        result = result.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+        return result;
+    }
+
     // ---- 长文本拆分（优先在标点处断句） ----
     function splitByLength(text, maxLen = maxMsgLen) {
         if (text.length <= maxLen) return [text];
@@ -719,6 +740,7 @@ function createBotInstance(config, options = {}) {
             reply = await queryAI(prompt);
         }
 
+        reply = stripMarkdown(reply);
         console.log(`${PREFIX} [AI-${aiProvider}] 回复: ${reply}`);
         ctx.reply(`[AI] ${reply}`);
     }
@@ -745,6 +767,11 @@ function createBotInstance(config, options = {}) {
         const match = findCommand(cmdName);
         if (!match) return `[错误] 未知命令: ${cmdName}`;
         if (!match.def.toolAllowed) return `[错误] 命令 ${cmdName} 不允许作为工具使用`;
+
+        // 工具调用时二次鉴权：即使 AI 工具列表中已过滤，此处作为纵深防御再检查一次
+        if (match.def.target === TARGET.TRUSTED && !originalCtx.isTrusted) {
+            return `[错误] 你没有权限使用命令 ${cmdName}`;
+        }
 
         // 清除旧的捕获状态，避免污染
         if (cmdCapture) {
@@ -874,8 +901,7 @@ function createBotInstance(config, options = {}) {
             + '当玩家询问金币余额等游戏内信息，或请求转账等游戏内操作时，你必须调用对应的工具函数来获取/执行，然后根据工具返回的真实结果回复。'
             + '严禁直接回复"我无法查看""我无法转账"等否定表述——工具赋予了你这些能力，直接使用即可。'
             + '注意：当玩家问"我有多少钱"或"查看XX的金币"时，必须将玩家ID作为参数传入money工具（如 money("玩家ID")），而不是无参调用。'
-            + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（看机器人自身背包，无法查看玩家背包）等。'
-            + '特别提醒：inventory 工具只能查看机器人(Bot)自身的背包，无法查看玩家的背包。'
+            + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（查看背包物品）等。'
         const messages = [
             { role: 'system', content: systemPrompt + toolHint },
             { role: 'user', content: userMessage },
@@ -1045,7 +1071,7 @@ function createBotInstance(config, options = {}) {
     cmd('/inv', ['/inv', '/inventory'],
         TRIGGER.WHISPER | TRIGGER.WEB | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
-        '/inv — 查看机器人(Bot)自身的物品栏（无法查看玩家背包）',
+        '/inv — 查看物品栏',
         (ctx) => {
             const items = bot.inventory.items();
             if (items.length === 0) { ctx.reply(`[${bot.username} 物品栏] 物品栏为空`); return; }
