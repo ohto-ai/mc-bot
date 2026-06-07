@@ -951,7 +951,7 @@ function createBotInstance(config, options = {}) {
     // ---- 信息查询 ----
 
     cmd('/nearby', ['/nearby'],
-        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/nearby — 查看附近实体（玩家 & 生物）',
         (ctx) => {
@@ -1042,7 +1042,7 @@ function createBotInstance(config, options = {}) {
     // ---- 信任玩家管理 ----
 
     cmd('/trust', ['/trust', '/trust list'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/trust [list] — 查看信任玩家列表',
         (ctx) => {
@@ -1054,7 +1054,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/trust add', ['/trust add'],
-        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/trust add <玩家名> — 添加信任玩家',
         (ctx, args) => {
@@ -1071,7 +1071,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/trust remove', ['/trust remove'],
-        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/trust remove <玩家名> — 移除信任玩家',
         (ctx, args) => {
@@ -1156,7 +1156,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot kill', ['/bot kill'],
-        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/bot kill <用户名> — 下线机器人',
         (ctx, args) => {
@@ -1191,7 +1191,7 @@ function createBotInstance(config, options = {}) {
         });
 
     cmd('/bot spawn', ['/bot spawn'],
-        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
         TARGET.TRUSTED,
         '/bot spawn <用户名> — 上线机器人',
         (ctx, args) => {
