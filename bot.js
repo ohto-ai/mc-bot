@@ -1806,37 +1806,15 @@ function createBotInstance(config, options = {}) {
                 );
             }
 
-            // 根据手中物品计算攻击冷却时间
+            // 从 bot.entity.attributes 读取服务端下发的实际攻击速度
             function getAttackCooldown() {
-                const item = bot.heldItem;
-                if (!item) return 650; // 空手默认按剑级冷却
-                const name = (item.name || '').toLowerCase();
-
-                // 剑 — 攻速 1.6 → 625ms
-                if (name.includes('sword')) return 650;
-
-                // 斧 — 钻石/铁 1.0 → 1s，石/木/金 0.8 → 1.25s
-                if (name.includes('_axe') || name.includes('axe')) {
-                    if (name.includes('diamond') || name.includes('iron') || name.includes('netherite')) return 1100;
-                    return 1300;
-                }
-
-                // 镐 — 1.2 → 833ms
-                if (name.includes('pickaxe')) return 850;
-
-                // 铲 — 1.0 → 1s
-                if (name.includes('shovel') || name.includes('spade')) return 1000;
-
-                // 锄 — 不同版本差异大，取安全值
-                if (name.includes('_hoe') || name.includes('hoe')) return 1000;
-
-                // 三叉戟 — 1.1 → 909ms
-                if (name.includes('trident')) return 950;
-
-                // 锤（重锤）— 0.6 → 1.67s
-                if (name.includes('mace')) return 1700;
-
-                return 650;
+                try {
+                    const attr = bot.entity?.attributes?.['generic.attack_speed'];
+                    if (attr && typeof attr.value === 'number' && attr.value > 0) {
+                        return Math.ceil(1000 / attr.value); // 攻速 → 冷却毫秒
+                    }
+                } catch (e) { /* fallthrough */ }
+                return 650; // 属性不可用时的安全回退
             }
 
             let attackCooldown = getAttackCooldown();
