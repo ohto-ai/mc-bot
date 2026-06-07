@@ -790,7 +790,16 @@ function createBotInstance(config, options = {}) {
         (ctx) => {
             const lines = [`[帮助] 可用指令 (${commandRegistry.length} 个):`];
             for (const c of commandRegistry) {
-                if (c.help) lines.push(c.help);
+                if (!c.help) continue;
+                // 将 "/cmd [args] — desc" 转为 "[cmd args] desc"，避免公聊中以 / 开头被当作服务器指令
+                const sepIdx = c.help.search(/\s+[—\-]\s+/);
+                if (sepIdx !== -1) {
+                    const cmdPart = c.help.slice(1, sepIdx).trim(); // 去掉开头的 /
+                    const descPart = c.help.slice(sepIdx).replace(/^\s+[—\-]\s+/, '').trim();
+                    lines.push(`[${cmdPart}] ${descPart}`);
+                } else {
+                    lines.push(c.help);
+                }
             }
             ctx.reply(lines.join('\n'));
         });
