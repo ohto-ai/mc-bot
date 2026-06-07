@@ -350,7 +350,7 @@ function createBotInstance(config, options = {}) {
     // ---- 命令输出捕获 ----
     function flushCmdCapture() {
         if (!cmdCapture) return;
-        const { target, messages } = cmdCapture;
+        const { target, type, messages } = cmdCapture;
         cmdCapture = null;
 
         if (messages.length > 0) {
@@ -360,12 +360,18 @@ function createBotInstance(config, options = {}) {
                 return true;
             });
             if (filtered.length > 0) {
-                safeWhisper(target, `[命令结果]\n${filtered.join('\n')}`);
+                const reply = `[命令结果]\n${filtered.join('\n')}`;
+                if (type === 'qq_at') sendQQReply(reply);
+                else safeWhisper(target, reply);
             } else {
-                safeWhisper(target, '[命令结果] (无有效输出)');
+                const reply = '[命令结果] (无有效输出)';
+                if (type === 'qq_at') sendQQReply(reply);
+                else safeWhisper(target, reply);
             }
         } else {
-            safeWhisper(target, '[命令结果] (无输出)');
+            const reply = '[命令结果] (无输出)';
+            if (type === 'qq_at') sendQQReply(reply);
+            else safeWhisper(target, reply);
         }
     }
 
@@ -693,6 +699,7 @@ function createBotInstance(config, options = {}) {
         console.log(`${PREFIX} [命令] ${ctx.sender} 执行: ${ctx.content}`);
         cmdCapture = {
             target: ctx.sender,
+            type: ctx.type,
             messages: [],
             timer: setTimeout(flushCmdCapture, 1500),
         };
@@ -734,12 +741,12 @@ function createBotInstance(config, options = {}) {
             return;
         }
 
-        // 未匹配的 / 命令：仅私聊可信玩家 → 远程命令转发（兜底）
+        // 未匹配的 / 命令：可信玩家（私聊 / QQ群@）→ 远程命令转发（兜底）
         if (content.startsWith('/')) {
-            if (ctx.type === 'whisper' && ctx.isTrusted) {
+            if (ctx.isTrusted && (ctx.type === 'whisper' || ctx.type === 'qq_at')) {
                 executeRemoteCommand(ctx);
                 return;
-            } else if (ctx.type === 'whisper') {
+            } else if (ctx.type === 'whisper' || ctx.type === 'qq_at') {
                 ctx.reply(`[命令] 未知命令: ${content.split(' ')[0]}。输入 /help 查看帮助`);
             }
             return;
