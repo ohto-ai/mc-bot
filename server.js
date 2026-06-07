@@ -3,18 +3,10 @@ const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const { createBotInstance } = require('./bot');
+const { loadConfig, getAIConfig, parseCookies } = require('./shared');
 
 // ========== 配置加载 ==========
 const configPath = path.join(__dirname, 'config.json');
-
-function loadConfig() {
-    try {
-        return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    } catch (err) {
-        console.error('无法读取 config.json:', err.message);
-        process.exit(1);
-    }
-}
 
 function saveConfig(config) {
     try {
@@ -64,29 +56,8 @@ console.warn = function (...args) {
     pushLog('warn', 'server', args.join(' '));
 };
 
-// ========== AI 配置（从 bot.js 提取） ==========
-function getAIConfig(config) {
-    const aiConfig = (config && config.ai) || {};
-
-    const deepseekApiKey = aiConfig.deepseek?.api_key || '';
-    const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
-    const DEEPSEEK_MODEL = 'deepseek-chat';
-
-    const mimoApiKey = aiConfig.mimo?.api_key || '';
-    const mimoRegion = aiConfig.mimo?.region || 'cn';
-    const MIMO_API_URL = mimoApiKey.startsWith('tp-')
-        ? `https://token-plan-${mimoRegion}.xiaomimimo.com/v1/chat/completions`
-        : 'https://api.xiaomimimo.com/v1/chat/completions';
-    const MIMO_MODEL = 'mimo-v2.5-pro';
-
-    return {
-        deepseekApiKey, DEEPSEEK_API_URL, DEEPSEEK_MODEL,
-        mimoApiKey, mimoRegion, MIMO_API_URL, MIMO_MODEL,
-    };
-}
-
 // ========== Bot 管理状态 ==========
-const config = loadConfig();
+const config = loadConfig(configPath);
 
 // ========== Web 鉴权配置 ==========
 function getWebAuthConfig() {
@@ -98,20 +69,33 @@ function getWebAuthConfig() {
     };
 }
 
-// ========== JWT 工具函数 ==========
-function parseCookies(req) {
-    const header = req.headers.cookie;
-    if (!header) return {};
-    const cookies = {};
-    header.split(';').forEach(c => {
-        const idx = c.indexOf('=');
-        if (idx > 0) {
-            cookies[c.slice(0, idx).trim()] = decodeURIComponent(c.slice(idx + 1).trim());
-        }
-    });
-    return cookies;
+// ========== 登录速率限制 ==========
+const loginRateLimit = new Map(); // ip -> { count, windowStart }
+
+function getClientIP(req) {
+    return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown';
 }
 
+function checkLoginRateLimit(ip) {
+    const now = Date.now();
+    let record = loginRateLimit.get(ip);
+    if (!record || now - record.windowStart > 60000) {
+        record = { count: 0, windowStart: now };
+        loginRateLimit.set(ip, record);
+    }
+    record.count++;
+    return record.count;
+}
+
+// 定期清理过期的速率限制记录（每 2 分钟）
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, record] of loginRateLimit) {
+        if (now - record.windowStart > 120000) loginRateLimit.delete(ip);
+    }
+}, 120000);
+
+// ========== JWT 工具函数 ==========
 function getToken(req) {
     // 1. Authorization: Bearer <token>
     const authHeader = req.headers.authorization;
@@ -145,6 +129,12 @@ app.use(express.json());
 // ========== 鉴权 API（无需登录） ==========
 
 app.post('/api/auth/login', (req, res) => {
+    const ip = getClientIP(req);
+    const attempts = checkLoginRateLimit(ip);
+    if (attempts > 5) {
+        return res.status(429).json({ error: '登录尝试过于频繁，请稍后再试' });
+    }
+
     const { username, password } = req.body || {};
     const authCfg = getWebAuthConfig();
 
@@ -184,6 +174,31 @@ app.get('/api/auth/status', (req, res) => {
 app.post('/api/auth/logout', (req, res) => {
     res.clearCookie('mc_bot_token');
     res.json({ success: true });
+});
+
+// ========== SSE 短期令牌（避免 JWT 出现在 URL 中） ==========
+const sseTokens = new Map(); // token -> { username, expiresAt }
+
+// 定期清理过期的 SSE 令牌
+setInterval(() => {
+    const now = Date.now();
+    for (const [token, data] of sseTokens) {
+        if (now > data.expiresAt) sseTokens.delete(token);
+    }
+}, 300000);
+
+// 获取短期 SSE 令牌（需要有效的 JWT 认证）
+app.post('/api/auth/sse-token', (req, res) => {
+    const token = getToken(req);
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ error: '未登录或登录已过期' });
+
+    const sseToken = require('crypto').randomBytes(32).toString('hex');
+    sseTokens.set(sseToken, {
+        username: decoded.username,
+        expiresAt: Date.now() + 5 * 60 * 1000, // 5 分钟有效期
+    });
+    res.json({ token: sseToken, expiresIn: 300 });
 });
 
 // ========== API 鉴权中间件（所有 /api/* 除 /api/auth/* 需登录） ==========
@@ -455,6 +470,25 @@ app.get('/api/logs', (req, res) => {
 
 // SSE 事件流
 app.get('/api/events', (req, res) => {
+    // 优先验证 SSE 短期令牌，其次回退到标准 JWT
+    const sseToken = req.query.token;
+    let authenticated = false;
+    if (sseToken) {
+        const tokenData = sseTokens.get(sseToken);
+        if (tokenData && Date.now() <= tokenData.expiresAt) {
+            authenticated = true;
+            // 使用后不删除令牌，允许重连
+        }
+    }
+    if (!authenticated) {
+        // 回退到标准 JWT 认证
+        const jwt = getToken(req);
+        if (!verifyToken(jwt)) {
+            res.status(401).json({ error: '未登录或登录已过期' });
+            return;
+        }
+    }
+
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',

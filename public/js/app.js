@@ -95,8 +95,24 @@ function bindEvents() {
 }
 
 // ========== SSE 连接 ==========
-function connectSSE() {
-    const es = new EventSource(`/api/events?token=${encodeURIComponent(getToken())}`);
+async function connectSSE() {
+    // 获取短期 SSE 令牌（避免长期 JWT 出现在 URL 中）
+    let sseToken;
+    try {
+        const res = await apiCall('POST', '/api/auth/sse-token');
+        if (res.error) {
+            console.error('获取 SSE 令牌失败:', res.error);
+            // 回退到直接使用 JWT（兼容旧版本）
+            sseToken = getToken();
+        } else {
+            sseToken = res.token;
+        }
+    } catch (err) {
+        console.error('SSE 令牌请求失败，回退到 JWT:', err);
+        sseToken = getToken();
+    }
+
+    const es = new EventSource(`/api/events?token=${encodeURIComponent(sseToken)}`);
 
     es.addEventListener('status', (e) => {
         try {

@@ -2,52 +2,7 @@ const mineflayer = require('mineflayer');
 const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
-
-// ========== 加载配置文件 ==========
-function loadConfig(configPath) {
-    const resolved = configPath || path.join(__dirname, 'config.json');
-    try {
-        return JSON.parse(fs.readFileSync(resolved, 'utf-8'));
-    } catch (err) {
-        console.error(`无法读取配置文件: ${resolved}`, err.message);
-        console.error('请从 config.example.json 复制并填写 config.json');
-        process.exit(1);
-    }
-}
-
-// ========== 共享 AI 配置（从 config.json 全局读取） ==========
-
-function getAIConfig(config) {
-    const aiConfig = (config && config.ai) || {};
-
-    // DeepSeek 配置
-    const deepseekApiKey = aiConfig.deepseek?.api_key || '';
-    const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
-    const DEEPSEEK_MODEL = 'deepseek-chat';
-
-    // 小米 MiMo 配置
-    // Token Plan 密钥 (tp-开头) 需要匹配对应区域的端点：
-    //   CN(中国):  token-plan-cn.xiaomimimo.com
-    //   SGP(新加坡): token-plan-sgp.xiaomimimo.com
-    //   AMS(阿姆斯特丹): token-plan-ams.xiaomimimo.com
-    // 按量付费密钥 (sk-开头) 用: api.xiaomimimo.com
-    const mimoApiKey = aiConfig.mimo?.api_key || '';
-    const mimoRegion = aiConfig.mimo?.region || 'cn';
-    const MIMO_API_URL = mimoApiKey.startsWith('tp-')
-        ? `https://token-plan-${mimoRegion}.xiaomimimo.com/v1/chat/completions`
-        : 'https://api.xiaomimimo.com/v1/chat/completions';
-    const MIMO_MODEL = 'mimo-v2.5-pro';
-
-    return {
-        deepseekApiKey,
-        DEEPSEEK_API_URL,
-        DEEPSEEK_MODEL,
-        mimoApiKey,
-        mimoRegion,
-        MIMO_API_URL,
-        MIMO_MODEL,
-    };
-}
+const { loadConfig, getAIConfig } = require('./shared');
 
 // ========== 共享 AI 调用函数 ==========
 
@@ -174,11 +129,12 @@ function createBotInstance(config, options = {}) {
     const PREFIX = `[${botName}]`;
 
     // ---- 统一 AI 调用入口（根据 bot 配置的 ai_provider 路由） ----
-    function queryAI(userMessage) {
+    function queryAI(userMessage, overrideSystemPrompt) {
+        const effectivePrompt = overrideSystemPrompt || systemPrompt;
         if (aiProvider === 'mimo') {
-            return queryMiMo(userMessage, systemPrompt, aiCfg);
+            return queryMiMo(userMessage, effectivePrompt, aiCfg);
         }
-        return queryDeepSeek(userMessage, systemPrompt, aiCfg);
+        return queryDeepSeek(userMessage, effectivePrompt, aiCfg);
     }
 
     // ---- 创建 Bot ----
@@ -368,16 +324,27 @@ function createBotInstance(config, options = {}) {
         return baseName;
     }
 
-    let cmdCapture = null;
     let menuDone = false;
     let menuSearch = null;
     let pendingConfirm = null;
+    let botFollowTarget = null;
+    let botFollowInterval = null;
+    let aiCallCount = 0;
 
-    // ---- 命令输出捕获 ----
-    function flushCmdCapture() {
-        if (!cmdCapture) return;
-        const { target, type, messages, _capture, _onFlush } = cmdCapture;
-        cmdCapture = null;
+    // ---- 命令输出捕获（基于 correlation ID 的 Map，支持并发） ----
+    const cmdCaptureMap = new Map(); // correlationId -> CaptureState
+    let captureIdCounter = 0;
+
+    function nextCaptureId() {
+        return `cap_${Date.now()}_${++captureIdCounter}`;
+    }
+
+    function flushCmdCapture(correlationId, forceMsg) {
+        const state = cmdCaptureMap.get(correlationId);
+        if (!state) return;
+        clearTimeout(state.timer);
+        cmdCaptureMap.delete(correlationId);
+        const { target, type, messages, _capture, _onFlush } = state;
 
         function sendOrCapture(reply) {
             if (_capture) {
@@ -389,7 +356,9 @@ function createBotInstance(config, options = {}) {
             }
         }
 
-        if (messages.length > 0) {
+        if (forceMsg) {
+            sendOrCapture(forceMsg);
+        } else if (messages.length > 0) {
             const filtered = [...new Set(messages)].filter(m => {
                 if (m.includes('/login')) return false;
                 if (m.includes('你还要再等') && m.includes('秒才能再次发送跨服消息')) return false;
@@ -406,6 +375,13 @@ function createBotInstance(config, options = {}) {
 
         // 通知 executeToolCall 捕获已完成（AI 工具调用用）
         if (_onFlush) _onFlush();
+    }
+
+    function startCapture(target, type, _capture, timeoutMs = 5000, prefillMessages = null) {
+        const id = nextCaptureId();
+        const timer = setTimeout(() => flushCmdCapture(id), timeoutMs);
+        cmdCaptureMap.set(id, { target, type, messages: prefillMessages || [], timer, _capture, _onFlush: null });
+        return id;
     }
 
     // ========== 菜单窗口自动化 ==========
@@ -611,11 +587,13 @@ function createBotInstance(config, options = {}) {
             }
         }
 
-        // 命令输出捕获
-        if (cmdCapture && !isSelfEcho) {
-            clearTimeout(cmdCapture.timer);
-            cmdCapture.messages.push(message);
-            cmdCapture.timer = setTimeout(flushCmdCapture, 1000);
+        // 命令输出捕获（广播到所有活跃捕获，支持并发）
+        if (cmdCaptureMap.size > 0 && !isSelfEcho) {
+            for (const [id, state] of cmdCaptureMap) {
+                clearTimeout(state.timer);
+                state.messages.push(message);
+                state.timer = setTimeout(() => flushCmdCapture(id), 1000);
+            }
         }
 
         // 登录检测
@@ -633,6 +611,7 @@ function createBotInstance(config, options = {}) {
 
     // ========== 机器人 spawn 行为 ==========
     bot.on('spawn', () => {
+        if (!bot._startTime) bot._startTime = Date.now();
         console.log(`${PREFIX} 进入游戏 (第 ${spawnCount} 次 spawn)，开始挂机`);
 
         if (!bot.activateItemInterval) {
@@ -666,13 +645,17 @@ function createBotInstance(config, options = {}) {
         TRUSTED: 'trusted',
     };
 
+    // MAX_PAY_AMOUNT：一次转账的最大金额（防止 bot 余额被恶意消耗）
+    const maxPayAmount = config.max_pay_amount || 100000;
+
     const commandRegistry = [];
 
     // 注册命令：cmd(名称, 匹配前缀数组, 触发条件, 触发对象, 帮助文本, 处理函数)
     // handler 签名: async (ctx, args) — ctx 为消息上下文，args 为命令参数
     // toolAllowed: 是否允许 AI 将此命令作为工具调用（默认 false，需显式 opt-in）
-    function cmd(name, patterns, triggers, target, help, handler, toolAllowed = false) {
-        commandRegistry.push({ name, patterns, triggers, target, help, handler, toolAllowed });
+    // toolParams: 可选的结构化参数 schema，格式 { paramName: { type, description, required } }
+    function cmd(name, patterns, triggers, target, help, handler, toolAllowed = false, toolParams = null) {
+        commandRegistry.push({ name, patterns, triggers, target, help, handler, toolAllowed, toolParams });
     }
 
     // 查找匹配的命令（最长前缀匹配，确保 /trust add 优先于 /trust）
@@ -723,13 +706,79 @@ function createBotInstance(config, options = {}) {
 
     // ========== AI 对话处理 ==========
 
+    // AI 调用频率限制（每玩家每分钟最多 30 次）
+    const AI_RATE_LIMIT = 30;
+    const aiCallCounts = new Map(); // sender -> { count, windowStart }
+
+    function checkAICallLimit(sender) {
+        const now = Date.now();
+        let record = aiCallCounts.get(sender);
+        if (!record || now - record.windowStart > 60000) {
+            record = { count: 0, windowStart: now };
+            aiCallCounts.set(sender, record);
+        }
+        record.count++;
+        return record.count <= AI_RATE_LIMIT;
+    }
+
+    // 定期清理过期的 AI 频率记录（每 2 分钟）
+    setInterval(() => {
+        const now = Date.now();
+        for (const [sender, record] of aiCallCounts) {
+            if (now - record.windowStart > 120000) aiCallCounts.delete(sender);
+        }
+    }, 120000);
+
+    // ========== AI 对话记忆（每玩家多轮对话上下文） ==========
+    const CONVERSATION_TTL = 30 * 60 * 1000; // 30 分钟过期
+    const CONVERSATION_MAX_TURNS = 10; // 最多保留 10 轮对话（20 条消息）
+    const conversationMemory = new Map(); // sender -> { messages[], lastAccess }
+
+    function getConversation(sender) {
+        const now = Date.now();
+        let conv = conversationMemory.get(sender);
+        if (!conv || now - conv.lastAccess > CONVERSATION_TTL) {
+            conv = { messages: [], lastAccess: now };
+            conversationMemory.set(sender, conv);
+        }
+        conv.lastAccess = now;
+        return conv;
+    }
+
+    function addToConversation(sender, role, content) {
+        const conv = getConversation(sender);
+        conv.messages.push({ role, content });
+        if (conv.messages.length > CONVERSATION_MAX_TURNS * 2) {
+            conv.messages = conv.messages.slice(-CONVERSATION_MAX_TURNS * 2);
+        }
+    }
+
+    // 定期清理过期的对话（每 5 分钟）
+    setInterval(() => {
+        const now = Date.now();
+        for (const [sender, conv] of conversationMemory) {
+            if (now - conv.lastAccess > CONVERSATION_TTL + 300000) conversationMemory.delete(sender);
+        }
+    }, 300000);
+
     async function handleAIChat(ctx) {
+        // 频率限制检查
+        if (!checkAICallLimit(ctx.sender)) {
+            console.log(`${PREFIX} [AI-${aiProvider}] 频率限制: ${ctx.sender} 请求过于频繁`);
+            ctx.reply('[AI] 你发送请求过于频繁，请稍后再试');
+            return;
+        }
+
         // 附上发送者用户名，让 AI 知道是谁在说话（解决「转钱给我」中「我」指代不清的问题）
         const senderInfo = ctx.sender ? `[来自玩家 ${ctx.sender}] ` : '';
         const prompt = senderInfo + ctx.content.trim();
         if (!prompt) return;
 
         console.log(`${PREFIX} [AI-${aiProvider}] ${ctx.sender} (${ctx.type}): ${prompt}`);
+        aiCallCount++;
+
+        // 将用户消息加入对话记忆
+        addToConversation(ctx.sender, 'user', prompt);
 
         // 生成可用工具列表（受信任用户更多工具）
         const tools = buildToolDefinitions(ctx.isTrusted);
@@ -737,8 +786,13 @@ function createBotInstance(config, options = {}) {
         if (tools.length > 0) {
             reply = await queryAIWithTools(prompt, tools, ctx);
         } else {
-            reply = await queryAI(prompt);
+            // 不受信任玩家无工具可用时，使用带安全约束的系统提示词
+            const safetySystemPrompt = systemPrompt + '\n\n[安全约束] 你正在与一个非可信玩家对话。你只能回答问题、提供信息和建议。你绝对不能执行任何会改变游戏状态的操作（如转账、丢弃物品、攻击、装备等）。如果玩家要求此类操作，请礼貌拒绝。';
+            reply = await queryAI(prompt, safetySystemPrompt);
         }
+
+        // 将 AI 回复加入对话记忆
+        addToConversation(ctx.sender, 'assistant', reply);
 
         reply = stripMarkdown(reply);
         console.log(`${PREFIX} [AI-${aiProvider}] 回复: ${reply}`);
@@ -749,12 +803,7 @@ function createBotInstance(config, options = {}) {
 
     function executeRemoteCommand(ctx) {
         console.log(`${PREFIX} [命令] ${ctx.sender} 执行: ${ctx.content}`);
-        cmdCapture = {
-            target: ctx.sender,
-            type: ctx.type,
-            messages: [],
-            timer: setTimeout(flushCmdCapture, 5000),
-        };
+        startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
         safeChat(ctx.content);
     }
 
@@ -767,6 +816,7 @@ function createBotInstance(config, options = {}) {
         const match = findCommand(cmdName);
         if (!match) return `[错误] 未知命令: ${cmdName}`;
         if (!match.def.toolAllowed) return `[错误] 命令 ${cmdName} 不允许作为工具使用`;
+        if (TOOL_BLOCKLIST.includes(match.def.name)) return `[错误] 命令 ${cmdName} 被禁止作为 AI 工具使用`;
 
         // 工具调用时二次鉴权：即使 AI 工具列表中已过滤，此处作为纵深防御再检查一次
         if (match.def.target === TARGET.TRUSTED && !originalCtx.isTrusted) {
@@ -774,9 +824,9 @@ function createBotInstance(config, options = {}) {
         }
 
         // 清除旧的捕获状态，避免污染
-        if (cmdCapture) {
-            clearTimeout(cmdCapture.timer);
-            cmdCapture = null;
+        for (const [id, state] of cmdCaptureMap) {
+            clearTimeout(state.timer);
+            flushCmdCapture(id, '[工具] 前一个命令已超时');
         }
 
         const captureBuffer = [];
@@ -785,13 +835,18 @@ function createBotInstance(config, options = {}) {
 
         try {
             console.log(`${PREFIX} [工具] ${originalCtx.sender} → ${match.def.name} ${args || ''}`);
+            // 记录 handler 执行前的活跃捕获 ID，以便之后识别新创建的捕获
+            const existingIds = new Set(cmdCaptureMap.keys());
             await match.def.handler(toolCtx, args || '');
 
-            // 如果 handler 设置了 cmdCapture（表示有异步服务器输出待捕获），等待 flush 完成
-            if (cmdCapture) {
-                await new Promise(resolve => {
-                    cmdCapture._onFlush = resolve;
-                });
+            // 查找 handler 执行期间新创建的、使用我们 captureBuffer 的捕获并等待其完成
+            for (const [id, state] of cmdCaptureMap) {
+                if (!existingIds.has(id) && state._capture === captureBuffer) {
+                    await new Promise(resolve => {
+                        state._onFlush = resolve;
+                    });
+                    break;
+                }
             }
         } catch (err) {
             console.error(`${PREFIX} [工具错误] ${match.def.name}:`, err.message);
@@ -805,7 +860,7 @@ function createBotInstance(config, options = {}) {
 
     // ========== 生成 OpenAI 工具定义 ==========
 
-    const TOOL_BLOCKLIST = ['/help', '/menu', '/confirm', '/trust', '/trust add', '/trust remove',
+    const TOOL_BLOCKLIST = ['/menu', '/confirm', '/trust', '/trust add', '/trust remove',
         '/bot add', '/bot del', '/bot enable', '/bot kill', '/bot spawn'];
 
     function buildToolDefinitions(isTrusted) {
@@ -823,32 +878,57 @@ function createBotInstance(config, options = {}) {
             const descMatch = helpText.match(/[—\-]\s*(.+)/);
             const description = descMatch ? descMatch[1].trim() : helpText;
 
-            // 从 help 文本提取参数说明
-            let argsDesc = '命令参数（通常不需要）';
-            const angleMatch = helpText.match(/<([^>]+)>/);
-            if (angleMatch) argsDesc = `必需参数: ${angleMatch[1]}`;
-            else {
-                const bracketMatch = helpText.match(/\[([^\]]+)\]/);
-                if (bracketMatch) argsDesc = `可选参数: ${bracketMatch[1]}`;
-            }
-
-            tools.push({
-                type: 'function',
-                function: {
-                    name: toolName,
-                    description: description,
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            args: {
-                                type: 'string',
-                                description: argsDesc,
-                            },
+            if (def.toolParams) {
+                // 使用结构化参数 schema
+                const properties = {};
+                const required = [];
+                for (const [paramName, paramDef] of Object.entries(def.toolParams)) {
+                    const prop = { type: paramDef.type, description: paramDef.description || paramName };
+                    if (paramDef.minimum !== undefined) prop.minimum = paramDef.minimum;
+                    if (paramDef.maximum !== undefined) prop.maximum = paramDef.maximum;
+                    properties[paramName] = prop;
+                    if (paramDef.required) required.push(paramName);
+                }
+                tools.push({
+                    type: 'function',
+                    function: {
+                        name: toolName,
+                        description: description,
+                        parameters: {
+                            type: 'object',
+                            properties,
+                            required,
                         },
-                        required: [],
                     },
-                },
-            });
+                });
+            } else {
+                // 回退到通用 args 字符串参数
+                let argsDesc = '命令参数（通常不需要）';
+                const angleMatch = helpText.match(/<([^>]+)>/);
+                if (angleMatch) argsDesc = `必需参数: ${angleMatch[1]}`;
+                else {
+                    const bracketMatch = helpText.match(/\[([^\]]+)\]/);
+                    if (bracketMatch) argsDesc = `可选参数: ${bracketMatch[1]}`;
+                }
+
+                tools.push({
+                    type: 'function',
+                    function: {
+                        name: toolName,
+                        description: description,
+                        parameters: {
+                            type: 'object',
+                            properties: {
+                                args: {
+                                    type: 'string',
+                                    description: argsDesc,
+                                },
+                            },
+                            required: [],
+                        },
+                    },
+                });
+            }
         }
         return tools;
     }
@@ -902,8 +982,20 @@ function createBotInstance(config, options = {}) {
             + '严禁直接回复"我无法查看""我无法转账"等否定表述——工具赋予了你这些能力，直接使用即可。'
             + '注意：当玩家问"我有多少钱"或"查看XX的金币"时，必须将玩家ID作为参数传入money工具（如 money("玩家ID")），而不是无参调用。'
             + '工具函数名与命令的对应关系：money = /money [玩家名]（查金币），pay = /pay 玩家名 金额（转账），inventory = /inv（查看背包物品）等。'
+        // 注入对话记忆（仅文本消息，不含工具调用内部消息）
+        const conv = getConversation(ctx.sender);
+        const historyMessages = conv.messages.slice(-CONVERSATION_MAX_TURNS * 2);
+        // 过滤掉工具调用轮次中的内部消息（只保留纯 user/assistant 对话）
+        const pureHistory = [];
+        for (const h of historyMessages) {
+            if (h.role === 'user' || h.role === 'assistant') {
+                pureHistory.push(h);
+            }
+        }
+
         const messages = [
             { role: 'system', content: systemPrompt + toolHint },
+            ...pureHistory.slice(-CONVERSATION_MAX_TURNS * 2), // 对话历史
             { role: 'user', content: userMessage },
         ];
 
@@ -938,7 +1030,21 @@ function createBotInstance(config, options = {}) {
                 let toolArgs = '';
                 try {
                     const parsed = JSON.parse(tc.function.arguments);
-                    toolArgs = parsed.args || '';
+                    // 查找匹配的命令定义以判断是否有结构化参数
+                    const cmdName = '/' + toolName.replace(/_/g, ' ');
+                    const cmdMatch = findCommand(cmdName);
+                    if (cmdMatch && cmdMatch.def.toolParams) {
+                        // 结构化参数：按 schema 顺序序列化为空格分隔的参数字符串
+                        const parts = [];
+                        for (const key of Object.keys(cmdMatch.def.toolParams)) {
+                            if (parsed[key] !== undefined && parsed[key] !== null) {
+                                parts.push(String(parsed[key]));
+                            }
+                        }
+                        toolArgs = parts.join(' ');
+                    } else {
+                        toolArgs = parsed.args || '';
+                    }
                 } catch (e) {
                     toolArgs = tc.function.arguments || '';
                 }
@@ -1095,7 +1201,9 @@ function createBotInstance(config, options = {}) {
             if (isNaN(slot) || slot < 1 || slot > 9) { ctx.reply('[切换] 用法: /hotbar <1-9>'); return; }
             bot.setQuickBarSlot(slot - 1);
             ctx.reply(`[切换] 已切换到快捷栏 ${slot}: ${formatItemName(bot.heldItem)}`);
-        }, true);
+        }, true, {
+            slot: { type: 'integer', description: '快捷栏栏位编号 (1-9)', minimum: 1, maximum: 9, required: true },
+        });
 
     // ---- 物品操作 ----
 
@@ -1122,7 +1230,10 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[丢弃] 失败: ${err.message}`);
             }
-        }, true);
+        }, true, {
+            itemName: { type: 'string', description: '要丢弃的物品名称（部分匹配）', required: true },
+            count: { type: 'integer', description: '丢弃数量（可选，默认为 1）', minimum: 1, required: false },
+        });
 
     cmd('/dropstack', ['/dropstack'],
         TRIGGER.WEB | TRIGGER.WHISPER,
@@ -1156,7 +1267,9 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[装备] 失败: ${err.message}`);
             }
-        }, true);
+        }, true, {
+            itemName: { type: 'string', description: '要装备到手中的物品名称', required: true },
+        });
 
     // ---- 攻击 ----
 
@@ -1180,7 +1293,9 @@ function createBotInstance(config, options = {}) {
             } catch (err) {
                 ctx.reply(`[攻击] 失败: ${err.message}`);
             }
-        }, true);
+        }, true, {
+            entityName: { type: 'string', description: '要攻击的实体名称（可选，不填则攻击最近敌对生物）', required: false },
+        });
 
     // ---- 物品使用 ----
 
@@ -1217,6 +1332,155 @@ function createBotInstance(config, options = {}) {
             } else {
                 ctx.reply('[使用] 当前未在持续右键');
             }
+        }, true);
+
+    // ---- 动作控制 ----
+
+    cmd('/stop', ['/stop'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/stop — 停止所有机器人动作（跟随、持续右键、移动等）',
+        (ctx) => {
+            // 停止跟随
+            if (botFollowInterval) {
+                clearInterval(botFollowInterval);
+                botFollowInterval = null;
+            }
+            botFollowTarget = null;
+            for (const ctrl of ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint']) {
+                bot.setControlState(ctrl, false);
+            }
+            // 停止持续右键（但不影响 spawn 时自动启动的 activateItemInterval）
+            if (bot.activateItemInterval) {
+                clearInterval(bot.activateItemInterval);
+                bot.activateItemInterval = null;
+            }
+            // 停止使用物品
+            if (bot.usingHeldItem) {
+                bot.deactivateItem();
+            }
+            ctx.reply('[动作] 已停止所有动作');
+        }, true);
+
+    cmd('/follow', ['/follow'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/follow <玩家名> — 跟随指定玩家',
+        (ctx, args) => {
+            const targetName = args.trim();
+            if (!targetName) { ctx.reply('[跟随] 用法: /follow <玩家名>'); return; }
+            const target = bot.players[targetName];
+            if (!target || !target.entity) {
+                ctx.reply(`[跟随] 未在附近找到玩家 "${targetName}"`);
+                return;
+            }
+
+            // 停止已有跟随
+            if (botFollowInterval) {
+                clearInterval(botFollowInterval);
+                botFollowInterval = null;
+            }
+            botFollowTarget = targetName;
+
+            const FOLLOW_DISTANCE = 3;
+            const FOLLOW_INTERVAL = 500;
+
+            botFollowInterval = setInterval(() => {
+                const player = bot.players[botFollowTarget];
+                if (!player || !player.entity) {
+                    // 目标丢失，停止移动
+                    for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint']) {
+                        bot.setControlState(ctrl, false);
+                    }
+                    return;
+                }
+
+                const dist = bot.entity.position.distanceTo(player.entity.position);
+                bot.lookAt(player.entity.position.offset(0, 1.6, 0), true);
+
+                if (dist > FOLLOW_DISTANCE + 1) {
+                    bot.setControlState('forward', true);
+                    bot.setControlState('sprint', dist > 8);
+                } else {
+                    bot.setControlState('forward', false);
+                    bot.setControlState('sprint', false);
+                }
+            }, FOLLOW_INTERVAL);
+
+            ctx.reply(`[跟随] 正在跟随 ${targetName}。使用 /stopfollow 或 /stop 停止`);
+        }, true, {
+            player: { type: 'string', description: '要跟随的玩家名称', required: true },
+        });
+
+    cmd('/stopfollow', ['/stopfollow'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/stopfollow — 停止跟随当前目标',
+        (ctx) => {
+            if (botFollowInterval) {
+                clearInterval(botFollowInterval);
+                botFollowInterval = null;
+            }
+            botFollowTarget = null;
+            for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint']) {
+                bot.setControlState(ctrl, false);
+            }
+            ctx.reply('[跟随] 已停止跟随');
+        }, true);
+
+    cmd('/collect', ['/collect'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/collect — 收集附近掉落物品（10 格范围，30 秒超时）',
+        (ctx) => {
+            const pos = bot.entity?.position;
+            if (!pos) { ctx.reply('[收集] 机器人尚未完全加载'); return; }
+
+            const items = Object.values(bot.entities)
+                .filter(e => e.name === 'item' && e.position && pos.distanceTo(e.position) <= 10)
+                .sort((a, b) => pos.distanceTo(a.position) - pos.distanceTo(b.position));
+
+            if (items.length === 0) {
+                ctx.reply('[收集] 附近没有掉落物品');
+                return;
+            }
+
+            ctx.reply(`[收集] 发现 ${items.length} 个掉落物品，正在收集...`);
+
+            let collectIndex = 0;
+            const COLLECT_INTERVAL = 500;
+            const collectInterval = setInterval(() => {
+                if (collectIndex >= items.length) {
+                    clearInterval(collectInterval);
+                    for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint']) {
+                        bot.setControlState(ctrl, false);
+                    }
+                    return;
+                }
+
+                const item = items[collectIndex];
+                if (!item || !item.position) {
+                    collectIndex++;
+                    return;
+                }
+
+                const dist = bot.entity.position.distanceTo(item.position);
+                if (dist < 2) {
+                    collectIndex++;
+                    return;
+                }
+
+                bot.lookAt(item.position, true);
+                bot.setControlState('forward', true);
+            }, COLLECT_INTERVAL);
+
+            // 30 秒安全超时
+            setTimeout(() => {
+                clearInterval(collectInterval);
+                for (const ctrl of ['forward', 'back', 'left', 'right', 'sprint']) {
+                    bot.setControlState(ctrl, false);
+                }
+            }, 30000);
         }, true);
 
     // ---- 信息查询 ----
@@ -1285,13 +1549,7 @@ function createBotInstance(config, options = {}) {
             // 第二部分：发送 /glist 查询全局各子服玩家
             console.log(`${PREFIX} [查询] ${ctx.sender} 查询全服玩家列表`);
             // 预加载本地数据到捕获缓冲区，glist 的服务器响应会追加在后面
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [...lines, '', '=== 全服玩家 (glist) ==='],  // 预填本地数据
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000, [...lines, '', '=== 全服玩家 (glist) ===']);
             safeChat('/glist');
         }, true);
 
@@ -1301,13 +1559,7 @@ function createBotInstance(config, options = {}) {
         '/glist — 仅查询 BungeeCord/Velocity 全局各子服玩家（不含本子服详情）',
         (ctx) => {
             console.log(`${PREFIX} [查询] ${ctx.sender} 查询全局玩家列表`);
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat('/glist');
         }, true);
 
@@ -1332,6 +1584,59 @@ function createBotInstance(config, options = {}) {
             ctx.reply(lines.join('\n'));
         }, true);
 
+    cmd('/status', ['/status'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/status — 查看机器人运行状态和诊断信息',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[状态] 机器人尚未完全加载'); return; }
+            const pos = entity.position;
+            const uptimeMs = Date.now() - (bot._startTime || Date.now());
+            const uptimeH = Math.floor(uptimeMs / 3600000);
+            const uptimeM = Math.floor((uptimeMs % 3600000) / 60000);
+            const uptimeS = Math.floor((uptimeMs % 60000) / 1000);
+            const mem = process.memoryUsage();
+            const memMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
+
+            const lines = [
+                '=== 机器人运行状态 ===',
+                `在线时长: ${uptimeH}h ${uptimeM}m ${uptimeS}s`,
+                `坐标: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`,
+                `生命/饥饿: ${Math.round(entity.health)}/${Math.round(entity.maxHealth || 20)} | ${bot.food ?? '?'}/20`,
+                `维度: ${bot.game.dimension || 'overworld'}`,
+                `天气: ${bot.thunderState > 0 ? '⛈ 雷雨' : bot.rainState > 0 ? '🌧 下雨' : '☀ 晴朗'}`,
+                `AI 调用次数: ${aiCallCount}`,
+                `内存占用: ${memMB} MB`,
+                `消息队列: ${messageQueue.length} 条待发送`,
+            ];
+            ctx.reply(lines.join('\n'));
+        }, true);
+
+    cmd('/weather', ['/weather'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/weather — 查看当前游戏天气',
+        (ctx) => {
+            const weather = bot.thunderState > 0 ? '⛈ 雷雨'
+                : bot.rainState > 0 ? '🌧 下雨'
+                : '☀ 晴朗';
+            ctx.reply(`[天气] 当前天气: ${weather}`);
+        }, true);
+
+    cmd('/time', ['/time'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/time — 查看当前游戏时间',
+        (ctx) => {
+            const timeOfDay = bot.time.timeOfDay;
+            const hours = Math.floor((timeOfDay / 1000) + 6) % 24;
+            const minutes = Math.floor(((timeOfDay % 1000) / 1000) * 60);
+            const period = hours >= 6 && hours < 18 ? '☀ 白天' : '🌙 夜晚';
+            const ticks = timeOfDay % 24000;
+            ctx.reply(`[时间] ${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')} (${period}) | Tick: ${ticks}`);
+        }, true);
+
     // ---- 经济系统 ----
 
     cmd('/money', ['/money'],
@@ -1342,15 +1647,11 @@ function createBotInstance(config, options = {}) {
             const target = args.trim();
             const cmdText = target ? `/money ${target}` : '/money';
             console.log(`${PREFIX} [经济] ${ctx.sender} 查询金币${target ? ' (目标: ' + target + ')' : ''}`);
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat(cmdText);
-        }, true);
+        }, true, {
+            player: { type: 'string', description: '要查询的玩家名称（可选，不填则查机器人自身余额）', required: false },
+        });
 
     cmd('/pay', ['/pay'],
         TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
@@ -1360,18 +1661,16 @@ function createBotInstance(config, options = {}) {
             const parts = args.trim().split(/\s+/);
             if (parts.length < 2) { ctx.reply('[转账] 用法: /pay <玩家名> <金额>'); return; }
             const target = parts[0];
-            const amount = parseInt(parts[1]);
-            if (isNaN(amount) || amount <= 0) { ctx.reply('[转账] 金额必须为正整数'); return; }
+            const amount = parseFloat(parts[1]);
+            if (isNaN(amount) || amount <= 0) { ctx.reply('[转账] 金额必须为正数'); return; }
+            if (amount > maxPayAmount) { ctx.reply(`[转账] 金额超过单次转账上限 ${maxPayAmount}，请分多次转账`); return; }
             console.log(`${PREFIX} [经济] ${ctx.sender} 转账 ${amount} 金币给 ${target}`);
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat(`/pay ${target} ${amount}`);
-        }, true);
+        }, true, {
+            player: { type: 'string', description: '接收金币的玩家名称', required: true },
+            amount: { type: 'number', description: '转账金额，支持小数', minimum: 0.01, required: true },
+        });
 
     // ---- 传送系统 ----
 
@@ -1383,15 +1682,11 @@ function createBotInstance(config, options = {}) {
             const target = args.trim();
             if (!target) { ctx.reply('[传送] 用法: /tpa <玩家名>'); return; }
             console.log(`${PREFIX} [传送] ${ctx.sender} 请求传送到 ${target}`);
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat(`/tpa ${target}`);
-        }, true);
+        }, true, {
+            player: { type: 'string', description: '要传送到的目标玩家名称', required: true },
+        });
 
     cmd('/tpahere', ['/tpahere'],
         TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
@@ -1401,15 +1696,11 @@ function createBotInstance(config, options = {}) {
             const target = args.trim();
             if (!target) { ctx.reply('[传送] 用法: /tpahere <玩家名>'); return; }
             console.log(`${PREFIX} [传送] ${ctx.sender} 请求 ${target} 传送到自己`);
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat(`/tpahere ${target}`);
-        }, true);
+        }, true, {
+            player: { type: 'string', description: '请求传送到你的位置的玩家名称', required: true },
+        });
 
     cmd('/tpaccept', ['/tpaccept'],
         TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
@@ -1417,13 +1708,7 @@ function createBotInstance(config, options = {}) {
         '/tpaccept — 同意当前的传送请求',
         (ctx) => {
             console.log(`${PREFIX} [传送] ${ctx.sender} 同意传送请求`);
-            cmdCapture = {
-                target: ctx.sender,
-                type: ctx.type,
-                messages: [],
-                timer: setTimeout(flushCmdCapture, 5000),
-                _capture: ctx._captureBuffer || null,
-            };
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
             safeChat('/tpaccept');
         }, true);
 
