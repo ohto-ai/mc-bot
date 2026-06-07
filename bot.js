@@ -1270,6 +1270,60 @@ function createBotInstance(config, options = {}) {
             safeChat(`/pay ${target} ${amount}`);
         }, true);
 
+    // ---- 传送系统 ----
+
+    cmd('/tpa', ['/tpa'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/tpa <玩家名> — 向指定玩家发送传送请求（传送到对方位置）',
+        (ctx, args) => {
+            const target = args.trim();
+            if (!target) { ctx.reply('[传送] 用法: /tpa <玩家名>'); return; }
+            console.log(`${PREFIX} [传送] ${ctx.sender} 请求传送到 ${target}`);
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [],
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat(`/tpa ${target}`);
+        }, true);
+
+    cmd('/tpahere', ['/tpahere'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/tpahere <玩家名> — 请求指定玩家传送到你的位置',
+        (ctx, args) => {
+            const target = args.trim();
+            if (!target) { ctx.reply('[传送] 用法: /tpahere <玩家名>'); return; }
+            console.log(`${PREFIX} [传送] ${ctx.sender} 请求 ${target} 传送到自己`);
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [],
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat(`/tpahere ${target}`);
+        }, true);
+
+    cmd('/tpaccept', ['/tpaccept'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/tpaccept — 同意当前的传送请求',
+        (ctx) => {
+            console.log(`${PREFIX} [传送] ${ctx.sender} 同意传送请求`);
+            cmdCapture = {
+                target: ctx.sender,
+                type: ctx.type,
+                messages: [],
+                timer: setTimeout(flushCmdCapture, 5000),
+                _capture: ctx._captureBuffer || null,
+            };
+            safeChat('/tpaccept');
+        }, true);
+
     // ---- 菜单操作 ----
 
     cmd('/menu', ['/menu'],
