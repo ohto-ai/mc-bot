@@ -1212,9 +1212,9 @@ function createBotInstance(config, options = {}) {
 
     // ========== AI 工具调用：执行命令并捕获输出 ==========
 
-    // 将 AI 传来的工具名（无 /、空格用 _ 替代）还原为命令文本并执行
+    // 将 AI 传来的工具名还原为命令文本并执行
     async function executeToolCall(toolName, args, originalCtx) {
-        // 下划线转回空格，拼成完整命令
+        // API 函数名中空格用 _ 替代，此处还原
         const cmdName = '/' + toolName.replace(/_/g, ' ');
         const match = findCommand(cmdName);
         if (!match) return `[错误] 未知命令: ${cmdName}`;
@@ -1273,8 +1273,8 @@ function createBotInstance(config, options = {}) {
             if (TOOL_BLOCKLIST.includes(def.name)) continue;
             if (def.target === TARGET.TRUSTED && !isTrusted) continue;
 
-            // 工具名：去掉 /、空格替换为 _（OpenAI 函数名要求 ^[a-zA-Z0-9_-]{1,64}$）
-            const toolName = def.name.replace(/^\//, '').replace(/\s+/g, '_');
+            // 工具名：去掉 /
+            const toolName = def.name.replace(/^\//, '');
 
             // 从 help 文本提取描述
             const helpText = def.help || '';
@@ -1295,7 +1295,7 @@ function createBotInstance(config, options = {}) {
                 tools.push({
                     type: 'function',
                     function: {
-                        name: toolName,
+                        name: toolName.replace(/\s+/g, '_'),  // API 要求无空格
                         description: description,
                         parameters: {
                             type: 'object',
@@ -1317,7 +1317,7 @@ function createBotInstance(config, options = {}) {
                 tools.push({
                     type: 'function',
                     function: {
-                        name: toolName,
+                        name: toolName.replace(/\s+/g, '_'),  // API 要求无空格
                         description: description,
                         parameters: {
                             type: 'object',
