@@ -1383,7 +1383,12 @@ function createBotInstance(config, options = {}) {
             + '当玩家询问金币余额等游戏内信息，你必须调用对应的工具函数来获取/执行，然后根据工具返回的真实结果回复。'
             + '严禁直接回复"我无法查看"等否定表述——工具赋予了你这些能力，直接使用即可。'
             + '注意：当玩家问"我有多少钱"或"查看XX的金币"时，必须将玩家ID作为参数传入money工具（如 money("玩家ID")），而不是无参调用。'
-            + '【关键规则】你必须严格根据工具返回的结果回复玩家，不得编造或假设结果。如果工具返回错误信息，如实告知玩家具体错误。';
+            + '【关键规则】你必须严格根据工具返回的结果回复玩家，不得编造或假设结果。如果工具返回错误信息，如实告知玩家具体错误。'
+            + '【自身状态查询工具】所有玩家均可使用以下工具查询机器人的自身属性（这些直接读取 bot 本地数据，无需调用服务器命令，结果实时准确）：'
+            + 'health = /health（查看血量、饥饿、护甲值等生命状态），effects = /effects（查看当前所有药水效果/buff/debuff），armor = /armor（查看当前装备），xp = /xp（查看经验等级和进度），oxygen = /oxygen（查看水下氧气剩余）。'
+            + '当玩家问"你多少血""你有什么buff""身上的装备""经验多少""水下氧气"等问题时，直接调用对应工具获取数据后再回复。'
+            + '【Residence 领地查询工具】（所有玩家可用）：res_info = /res info [领地名]（查询领地信息），res_list = /res list [玩家名]（查看领地列表），res_listall = /res listall（列出全部领地）。'
+            + '当玩家问"查看领地""有哪些领地""这个领地是谁的"等请求时使用。注意这些工具会向服务器发送命令并等待响应，结果可能稍有延迟。';
 
         // 可信玩家专属工具说明
         if (ctx.isTrusted) {
@@ -1394,6 +1399,17 @@ function createBotInstance(config, options = {}) {
                 + 'server = /server 服务器名（通过菜单切换到指定子服，支持模糊匹配如"主服""S1""S3"），当玩家说"去XX服""切换到XX""换服""去主服/S1/S3"等请求时使用。'
                 + '使用 minechunk 时，可传入半径参数控制挖掘范围，如 minechunk(3) 挖掘3格半径内的方块。'
                 + 'attackloop = /attackloop [实体名] [范围]（持续攻击，默认攻击所有敌对生物，范围6格），当玩家说"挂机攻击""帮我清怪""刷袭击""打猪灵"等请求时使用。使用 /stop 停止。'
+                + '【Residence 领地传送工具】（仅可信玩家可用）：res_tp = /res tp 领地名（传送到指定领地），res_tpa = /res tpa 领地名 玩家名（请求玩家传送到某领地）。'
+                + '当玩家说"传送到XX领地""带我去XX领地""把YY传送到XX领地"等请求时使用。'
+                + '【动作姿态工具】（仅可信玩家可用，均为切换式命令——调用一次进入姿态，再次调用同一工具即可恢复站立）：'
+                + 'sit = /sit（坐下/站起），crawl = /crawl（趴下/站起），lay = /lay（躺下/站起），spin = /spin（旋转/停止），bellyflop = /bellyflop（肚子着地/站起）。'
+                + '当玩家说"坐下""趴下""躺下""转圈""跳舞"等请求时使用对应工具。'
+                + 'taunt = /taunt（连续快速蹲起约15次，持续约2秒，用作挑衅/嘲讽）。当玩家说"挑衅""嘲讽""蹲起"等请求时使用。'
+                + '【取消姿态】sneak = /sneak（机器人自己按 Shift 再松开，可一键解除所有 GSit 姿势恢复站立）。'
+                + '当玩家说"站起来""起来""恢复站立""取消坐下""别转圈了""停下"等请求时，直接调用 sneak() 或再次调用同一个工具即可。绝对不要叫玩家自己按 Shift——机器人自己会按。'
+                + '注意：调用一次 spin() 后，机器人做出旋转动作，工具返回"已切换旋转状态"；如果此时玩家说"别转了"，你需要再调用一次 spin() 切回来，或者直接调用 sneak() 也可恢复站立。'
+                + '【AFK挂机工具】（仅可信玩家可用）：afk = /afk [消息]（切换AFK状态，可选自定义消息）。'
+                + '当玩家说"挂机""暂离""AFK"等请求时使用。'
                 + '【重要安全保证】该账号免疫所有伤害（无敌），且始终在领地内操作（不会违规），并且一定已开启双击空格飞行。'
                 + '但飞行会降低挖掘速度——机器人已优化为仅在目标高度差超过3格时才启动飞行，其余情况保持地面行走。'
                 + '因此你无需担心跌落、岩浆、怪物等问题——大胆使用 minechunk 挖掘全部方块，不要畏手畏脚。';
@@ -2700,6 +2716,326 @@ function createBotInstance(config, options = {}) {
             }
         }, true, {
             username: { type: 'string', description: '要启动的机器人用户名（必须在配置中存在）', required: true },
+        });
+
+    // ========== 自身属性查询（无需可信，直接读取 bot.entity API） ==========
+
+    // 药水效果 ID → 名称映射
+    const EFFECT_NAMES = {
+        1: '速度', 2: '缓慢', 3: '急迫', 4: '挖掘疲劳', 5: '力量',
+        6: '瞬间治疗', 7: '瞬间伤害', 8: '跳跃提升', 9: '反胃',
+        10: '生命恢复', 11: '抗性提升', 12: '防火', 13: '水下呼吸',
+        14: '隐身', 15: '失明', 16: '夜视', 17: '饥饿', 18: '虚弱',
+        19: '中毒', 20: '凋零', 21: '生命提升', 22: '伤害吸收',
+        23: '饱和', 24: '发光', 25: '飘浮', 26: '幸运', 27: '霉运',
+        28: '缓降', 29: '潮涌能量', 30: '海豚的恩惠', 31: '不祥之兆',
+        32: '村庄英雄', 33: '黑暗',
+    };
+
+    cmd('/health', ['/health'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/health — 查看机器人的详细生命状态（血量、吸收值、生命提升）',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[生命] 机器人尚未完全加载'); return; }
+            const health = Math.round(entity.health * 10) / 10;
+            const maxHealth = Math.round((entity.maxHealth || 20) * 10) / 10;
+            const lines = [
+                `=== 生命状态 ===`,
+                `血量: ${health}/${maxHealth}`,
+                `饥饿: ${bot.food ?? '?'}/20`,
+                `饱和度: ${typeof bot.foodSaturation === 'number' ? bot.foodSaturation.toFixed(1) : '?'}`,
+            ];
+            // 检查属性：最大生命值（生命提升）、护甲值、盔甲韧性
+            if (entity.attributes) {
+                const maxHpAttr = entity.attributes['generic.max_health'];
+                if (maxHpAttr && maxHpAttr.value) {
+                    lines.push(`基础最大生命: ${Math.round(maxHpAttr.value * 10) / 10} (含生命提升)`);
+                }
+                const armorAttr = entity.attributes['generic.armor'];
+                if (armorAttr && armorAttr.value > 0) {
+                    lines.push(`护甲值: ${armorAttr.value}`);
+                }
+                const armorToughness = entity.attributes['generic.armor_toughness'];
+                if (armorToughness && armorToughness.value > 0) {
+                    lines.push(`盔甲韧性: ${armorToughness.value}`);
+                }
+            }
+            ctx.reply(lines.join('\n'));
+        }, true);
+
+    cmd('/effects', ['/effects', '/buffs'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/effects — 查看机器人当前的所有药水效果（buff/debuff）',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[效果] 机器人尚未完全加载'); return; }
+            const effects = entity.effects;
+            if (!effects || Object.keys(effects).length === 0) {
+                ctx.reply('[效果] 当前无任何药水效果');
+                return;
+            }
+            const lines = ['=== 当前药水效果 ==='];
+            for (const [id, effect] of Object.entries(effects)) {
+                const name = EFFECT_NAMES[id] || `效果#${id}`;
+                const level = (effect.amplifier || 0) + 1; // amplifier 0 = 等级1
+                const durationSec = Math.round((effect.duration || 0) / 20); // ticks → 秒
+                const isNegative = [2, 4, 7, 9, 15, 17, 18, 19, 20, 25, 27, 31, 33].includes(Number(id));
+                const icon = isNegative ? '⚠' : '✦';
+                const durText = durationSec > 0
+                    ? `${Math.floor(durationSec / 60)}分${durationSec % 60}秒`
+                    : '永久';
+                lines.push(`${icon} ${name} Lv.${level} (剩余: ${durText})`);
+            }
+            ctx.reply(lines.join('\n'));
+        }, true);
+
+    cmd('/armor', ['/armor', '/equipment'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/armor — 查看机器人当前装备（盔甲、手持、副手）',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[装备] 机器人尚未完全加载'); return; }
+            const eq = entity.equipment;
+            const slotNames = ['手持', '副手', '靴子', '护腿', '胸甲', '头盔'];
+            const lines = ['=== 当前装备 ==='];
+            let hasAny = false;
+            for (let i = 0; i < slotNames.length; i++) {
+                const item = eq && eq[i];
+                if (item) {
+                    hasAny = true;
+                    const name = item.displayName || item.name || '(未知)';
+                    const durability = item.durabilityUsed !== undefined
+                        ? ` [耐久: ${((1 - item.durabilityUsed) * 100).toFixed(0)}%]`
+                        : '';
+                    lines.push(`${slotNames[i]}: ${name}${durability}`);
+                } else {
+                    lines.push(`${slotNames[i]}: (空)`);
+                }
+            }
+            ctx.reply(lines.join('\n'));
+        }, true);
+
+    cmd('/xp', ['/xp', '/experience'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/xp — 查看机器人当前经验值',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[经验] 机器人尚未完全加载'); return; }
+            const level = bot.experience?.level ?? 0;
+            const points = bot.experience?.points ?? 0;
+            const progress = bot.experience?.progress ?? 0;
+            const neededForNext = Math.round(points / (progress > 0 ? progress : 1));
+            const lines = [
+                '=== 经验状态 ===',
+                `等级: ${level}`,
+                `经验点: ${points}`,
+                `升级进度: ${(progress * 100).toFixed(1)}%`,
+            ];
+            if (level > 0 && points > 0) {
+                lines.push(`距下一级还需约: ${neededForNext - points} 点`);
+            }
+            ctx.reply(lines.join('\n'));
+        }, true);
+
+    cmd('/oxygen', ['/oxygen', '/air'],
+        TRIGGER.MENTION | TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.QQ_AT,
+        TARGET.ALL,
+        '/oxygen — 查看机器人水下氧气剩余',
+        (ctx) => {
+            const entity = bot.entity;
+            if (!entity) { ctx.reply('[氧气] 机器人尚未完全加载'); return; }
+            const oxygen = entity.oxygen !== undefined ? entity.oxygen : (entity.metadata && entity.metadata[1] !== undefined ? entity.metadata[1] : null);
+            if (oxygen === null || oxygen === undefined) {
+                ctx.reply('[氧气] 无法获取氧气数据（可能不在水中或数据不可用）');
+                return;
+            }
+            const maxOxygen = 300; // 默认最大氧气值（15秒 × 20 ticks）
+            const pct = Math.round((oxygen / maxOxygen) * 100);
+            ctx.reply(`[氧气] 剩余氧气: ${oxygen}/${maxOxygen} (${pct}%)`);
+        }, true);
+
+    // ========== Residence 插件命令 ==========
+    // 查询类命令（所有玩家可用）
+
+    cmd('/res info', ['/res info'],
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.ALL,
+        '/res info [领地名] — 查看当前所在领地（或指定领地）的信息',
+        (ctx, args) => {
+            const target = args.trim();
+            const cmdText = target ? `/res info ${target}` : '/res info';
+            console.log(`${PREFIX} [Residence] ${ctx.sender} 查询领地信息${target ? ' (目标: ' + target + ')' : ''}`);
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
+            safeChat(cmdText);
+        }, true, {
+            residence: { type: 'string', description: '要查询的领地名称（可选，不填则查询当前所在领地）', required: false },
+        });
+
+    cmd('/res list', ['/res list'],
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.ALL,
+        '/res list [玩家名] — 查看领地列表（不填则列出服务器的领地）',
+        (ctx, args) => {
+            const target = args.trim();
+            const cmdText = target ? `/res list ${target}` : '/res list';
+            console.log(`${PREFIX} [Residence] ${ctx.sender} 查询领地列表${target ? ' (玩家: ' + target + ')' : ''}`);
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
+            safeChat(cmdText);
+        }, true, {
+            player: { type: 'string', description: '要查询的玩家名称（可选）', required: false },
+        });
+
+    cmd('/res listall', ['/res listall'],
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.ALL,
+        '/res listall — 列出服务器全部领地',
+        (ctx) => {
+            console.log(`${PREFIX} [Residence] ${ctx.sender} 查询全部领地列表`);
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
+            safeChat('/res listall');
+        }, true);
+
+    // Residence TP 命令（仅可信玩家可用——会改变 bot 位置）
+
+    cmd('/res tp', ['/res tp'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/res tp <领地名> — 传送到指定领地',
+        (ctx, args) => {
+            const target = args.trim();
+            if (!target) { ctx.reply('[Residence] 用法: /res tp <领地名>'); return; }
+            console.log(`${PREFIX} [Residence] ${ctx.sender} 传送到领地 ${target}`);
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
+            safeChat(`/res tp ${target}`);
+        }, true, {
+            residence: { type: 'string', description: '要传送到的领地名称', required: true },
+        });
+
+    cmd('/res tpa', ['/res tpa'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/res tpa <领地名> <玩家名> — 请求指定玩家传送到某个领地',
+        (ctx, args) => {
+            const parts = args.trim().split(/\s+/);
+            if (parts.length < 2) { ctx.reply('[Residence] 用法: /res tpa <领地名> <玩家名>'); return; }
+            const resName = parts[0];
+            const playerName = parts.slice(1).join(' ');
+            console.log(`${PREFIX} [Residence] ${ctx.sender} 请求 ${playerName} 传送到领地 ${resName}`);
+            startCapture(ctx.sender, ctx.type, ctx._captureBuffer || null, 5000);
+            safeChat(`/res tpa ${resName} ${playerName}`);
+        }, true, {
+            residence: { type: 'string', description: '目标领地名称', required: true },
+            player: { type: 'string', description: '要传送的玩家名称', required: true },
+        });
+
+    // ========== GSit 动作命令（仅可信玩家可用——改变 bot 姿态） ==========
+
+    cmd('/sit', ['/sit'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/sit — 切换机器人坐下/站起（重复调用可恢复站立；也可用 /sneak 解除）',
+        (ctx) => {
+            console.log(`${PREFIX} [GSit] ${ctx.sender} 切换机器人坐下状态`);
+            safeChat('/sit');
+            ctx.reply('[动作] 已切换坐姿');
+        }, true);
+
+    cmd('/crawl', ['/crawl'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/crawl — 切换机器人趴下/站起（重复调用可恢复站立；也可用 /sneak 解除）',
+        (ctx) => {
+            console.log(`${PREFIX} [GSit] ${ctx.sender} 切换机器人趴下状态`);
+            safeChat('/crawl');
+            ctx.reply('[动作] 已切换匍匐姿态');
+        }, true);
+
+    cmd('/lay', ['/lay'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/lay — 切换机器人躺下/站起（重复调用可恢复站立；也可用 /sneak 解除）',
+        (ctx) => {
+            console.log(`${PREFIX} [GSit] ${ctx.sender} 切换机器人躺下状态`);
+            safeChat('/lay');
+            ctx.reply('[动作] 已切换躺姿');
+        }, true);
+
+    cmd('/spin', ['/spin'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/spin — 切换机器人旋转/停止（重复调用可停止旋转；也可用 /sneak 解除）',
+        (ctx) => {
+            console.log(`${PREFIX} [GSit] ${ctx.sender} 切换机器人旋转状态`);
+            safeChat('/spin');
+            ctx.reply('[动作] 已切换旋转状态');
+        }, true);
+
+    cmd('/bellyflop', ['/bellyflop'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/bellyflop — 切换机器人肚子着地/站起（重复调用可恢复站立；也可用 /sneak 解除）',
+        (ctx) => {
+            console.log(`${PREFIX} [GSit] ${ctx.sender} 切换机器人肚子着地状态`);
+            safeChat('/bellyflop');
+            ctx.reply('[动作] 已切换肚子着地姿态');
+        }, true);
+
+    // ========== 潜行（Shift）命令 —— 恢复站立的万能方法 ==========
+
+    cmd('/sneak', ['/sneak', '/shift'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/sneak — 让机器人按一下 Shift 潜行键再松开（可解除 GSit 坐/躺/趴/旋转等所有姿势，恢复到正常站立）',
+        (ctx) => {
+            console.log(`${PREFIX} [动作] ${ctx.sender} 让机器人按 Shift 潜行`);
+            bot.setControlState('sneak', true);
+            setTimeout(() => {
+                bot.setControlState('sneak', false);
+            }, 150);
+            ctx.reply('[动作] 已按 Shift 潜行后再松开，姿势已恢复站立');
+        }, true);
+
+    // ========== 挑衅动作（连续快速蹲起） ==========
+
+    cmd('/taunt', ['/taunt'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/taunt — 让机器人连续快速蹲起（约15次，持续约2秒），用作挑衅/嘲讽动作',
+        (ctx) => {
+            console.log(`${PREFIX} [动作] ${ctx.sender} 让机器人挑衅`);
+            const count = 15;
+            const interval = 140; // 每 140ms 切换一次 → 2.1 秒
+            let i = 0;
+            const timer = setInterval(() => {
+                bot.setControlState('sneak', i % 2 === 0);
+                i++;
+                if (i >= count) {
+                    clearInterval(timer);
+                    bot.setControlState('sneak', false); // 确保最终松开
+                }
+            }, interval);
+            ctx.reply('[动作] 正在挑衅！（连续蹲起）');
+        }, true);
+
+    // ========== AFK 挂机命令（仅可信玩家可用） ==========
+
+    cmd('/afk', ['/afk'],
+        TRIGGER.WHISPER | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/afk [消息] — 切换机器人 AFK 状态（可选自定义 AFK 消息）',
+        (ctx, args) => {
+            const afkMsg = args.trim();
+            const cmdText = afkMsg ? `/afk ${afkMsg}` : '/afk';
+            console.log(`${PREFIX} [AFK] ${ctx.sender} 切换机器人 AFK 状态${afkMsg ? ' (消息: ' + afkMsg + ')' : ''}`);
+            safeChat(cmdText);
+            ctx.reply(`[AFK] 已切换 AFK 状态${afkMsg ? ' (消息: ' + afkMsg + ')' : ''}`);
+        }, true, {
+            message: { type: 'string', description: '自定义 AFK 消息（可选）', required: false },
         });
 
     // ========== 事件处理器 ==========
