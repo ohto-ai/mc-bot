@@ -2,7 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
-const { createBotInstance } = require('./bot');
+const { createBotInstance, checkBuddyWatchChain } = require('./bot');
 const { loadConfig, getAIConfig, parseCookies } = require('./shared');
 
 // ========== 配置加载 ==========
@@ -233,6 +233,28 @@ const defaults = config.defaults || {};
 const aiCfg = getAIConfig(config);
 const botRegistry = new Map();
 
+// TPS 紧急下线回调（全局，所有 bot 共享）
+function emergencyShutdown(reason) {
+    console.log(`[主进程] ⚠️ 紧急下线触发！原因: ${reason}`);
+    pushLog('error', 'server', `⚠️ 紧急下线触发！原因: ${reason}`);
+    console.log(`[主进程] 正在下线所有机器人...`);
+    let count = 0;
+    for (const [key, b] of botRegistry) {
+        try {
+            console.log(`[主进程] 下线: ${b._botName || b.username}`);
+            pushLog('warn', b._botName || key, `紧急下线: ${b.username}`);
+            b.end();
+            count++;
+        } catch (e) {
+            console.error(`[主进程] 下线 ${key} 失败:`, e.message);
+        }
+    }
+    botRegistry.clear();
+    console.log(`[主进程] 已下线 ${count} 个机器人`);
+    pushLog('info', 'server', `紧急下线完成: 已下线 ${count} 个机器人`);
+    sendSseStatus();
+}
+
 // 记录每个 bot 的启动时间和最近聊天消息
 const botMeta = new Map(); // name_lower -> { startTime, recentChats: [] }
 
@@ -258,6 +280,7 @@ function spawnBotFromConfig(botCfg) {
         saveBotsConfig,
         spawnBotFromConfig,
         aiCfg,
+        emergencyShutdown,
     });
 
     botRegistry.set(lowerUser, bot);
@@ -290,6 +313,8 @@ function spawnBotFromConfig(botCfg) {
         pushLog('warn', merged.name, `[${merged.username}] 连接断开: ${reason}`);
         botRegistry.delete(lowerUser);
         sendSseStatus();
+        // Buddy Watch 链式传播
+        checkBuddyWatchChain(merged.name, merged.username, botRegistry);
     });
 
     bot.on('kicked', (reason) => {
@@ -297,6 +322,8 @@ function spawnBotFromConfig(botCfg) {
         pushLog('error', merged.name, `[${merged.username}] 被踢出: ${reasonStr}`);
         botRegistry.delete(lowerUser);
         sendSseStatus();
+        // Buddy Watch 链式传播
+        checkBuddyWatchChain(merged.name, merged.username, botRegistry);
     });
 
     bot.on('error', (err) => {
