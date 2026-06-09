@@ -98,7 +98,7 @@ function createBotInstance(config, options = {}) {
         password,
         version,
         ai_provider: aiProvider,
-        system_prompt: systemPrompt,
+        system_prompt: _systemPrompt,
         trusted_players: trustedPlayers,
         queue_delay: initialQueueDelay,
         max_msg_len: maxMsgLen,
@@ -107,6 +107,11 @@ function createBotInstance(config, options = {}) {
         default_server: defaultServer,
         tp_reply: tpReply,
     } = config;
+
+    // 为每个 bot 实例注入独立的身份信息，防止多 bot 之间身份混淆
+    const systemPrompt = _systemPrompt
+        + `\n\n[身份信息] 你是机器人「${botName}」（游戏内名称: ${username}）。`
+        + ` 当玩家问"你是谁""你叫什么名字"时，必须回答你是「${botName}」，不要只说自己是一个 AI 助手。`;
 
     // 持久化 trusted_players 的配置路径（由主入口传入）
     const configPath = options.configPath;
