@@ -18,8 +18,20 @@ function saveConfig(config) {
 
 // ========== 日志缓冲（用于 Web 展示） ==========
 const MAX_LOG_LINES = 500;
-const logBuffer = [];
+const logBuffer = new Array(MAX_LOG_LINES); // 环形缓冲区，避免 shift() O(n) 开销
+let _logIndex = 0; // 写入指针，递增永不重置
 const sseClients = new Set();
+
+/** 获取日志缓冲区中最近 N 条记录（环形读取） */
+function getRecentLogs(n = MAX_LOG_LINES) {
+    n = Math.min(n, MAX_LOG_LINES);
+    const start = Math.max(0, _logIndex - n);
+    const result = [];
+    for (let i = start; i < _logIndex; i++) {
+        result.push(logBuffer[i % MAX_LOG_LINES]);
+    }
+    return result;
+}
 
 function pushLog(level, source, message) {
     const entry = {
@@ -28,8 +40,8 @@ function pushLog(level, source, message) {
         source,  // bot name 或 'server'
         message,
     };
-    logBuffer.push(entry);
-    if (logBuffer.length > MAX_LOG_LINES) logBuffer.shift();
+    logBuffer[_logIndex % MAX_LOG_LINES] = entry;
+    _logIndex++;
 
     // 推送到所有 SSE 客户端
     const data = JSON.stringify(entry);
@@ -488,7 +500,7 @@ app.post('/api/bots/:name/disable', (req, res) => {
 app.get('/api/logs', (req, res) => {
     const limit = parseInt(req.query.limit) || 200;
     const source = req.query.source; // 可选：按 bot 名称过滤
-    let logs = logBuffer;
+    let logs = getRecentLogs(MAX_LOG_LINES);
     if (source) {
         logs = logs.filter(l => l.source === source);
     }
@@ -612,6 +624,13 @@ app.get('/api/events', (req, res) => {
         clearInterval(heartbeat);
     });
 });
+
+// 定期清理僵死 SSE 客户端（每 60 秒）
+setInterval(() => {
+    for (const client of sseClients) {
+        try { client.write(`: ping\n\n`); } catch (e) { sseClients.delete(client); }
+    }
+}, 60000);
 
 // SPA fallback — 非 API/静态文件请求返回 index.html（需登录）
 app.use((req, res, next) => {

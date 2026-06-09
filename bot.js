@@ -236,6 +236,7 @@ function createBotInstance(config, options = {}) {
     bot._lastTps = 20; // 初始假设满 TPS
     bot._tpsMonitorCleanup = null;
     bot._lastEmergencyShutdown = 0;
+    bot._intervals = []; // 收集所有 setInterval ID，断线时统一清理
 
     // ---- 调试日志：监听所有关键事件 ----
     const events = [
@@ -546,7 +547,7 @@ function createBotInstance(config, options = {}) {
     }
 
     // 扫描区块内所有可挖掘方块（按距离排序，从近到远）
-    function scanChunkBlocks(maxCount = 5000) {
+    function scanChunkBlocks(maxCount = 2000) {
         const entity = bot.entity;
         if (!entity) return [];
         const pos = entity.position;
@@ -651,7 +652,9 @@ function createBotInstance(config, options = {}) {
     // 异步挖掘单个方块（自动切换工具）
     async function mineSingleBlock(blockInfo) {
         if (!botMiningActive) return false;
-        const { block, x, y, z } = blockInfo;
+        const { x, y, z } = blockInfo;
+        const block = bot.blockAt(new Vec3(x, y, z));
+        if (!block) return false;
 
         // 辅助函数：停止所有移动控制
         const stopAllMove = () => {
@@ -1013,6 +1016,16 @@ function createBotInstance(config, options = {}) {
             bot._tpsMonitorCleanup();
             bot._tpsMonitorCleanup = null;
         }
+        // 清理 activateItem 定时器
+        if (bot.activateItemInterval) {
+            clearInterval(bot.activateItemInterval);
+            bot.activateItemInterval = null;
+        }
+        // 清理所有收集的 setInterval（AI 频率记录、对话记忆清理等）
+        for (const id of bot._intervals) {
+            clearInterval(id);
+        }
+        bot._intervals = [];
         // 从注册表中移除自身
         const myLowerUser = (username || '').toLowerCase();
         if (options.botRegistry) {
@@ -1077,10 +1090,16 @@ function createBotInstance(config, options = {}) {
 
         // 命令输出捕获（广播到所有活跃捕获，支持并发）
         if (cmdCaptureMap.size > 0 && !isSelfEcho) {
+            const MAX_CAPTURE_MESSAGES = 200; // 每个捕获最多缓存 200 条消息
             for (const [id, state] of cmdCaptureMap) {
                 clearTimeout(state.timer);
                 state.messages.push(message);
-                state.timer = setTimeout(() => flushCmdCapture(id), 1000);
+                // 超过上限立即 flush，避免无限增长
+                if (state.messages.length >= MAX_CAPTURE_MESSAGES) {
+                    flushCmdCapture(id);
+                } else {
+                    state.timer = setTimeout(() => flushCmdCapture(id), 5000);
+                }
             }
         }
 
@@ -1245,16 +1264,18 @@ bot.on('playerLeft', (player) => {
     }
 
     // 定期清理过期的 AI 频率记录（每 2 分钟）
-    setInterval(() => {
+    bot._intervals.push(setInterval(() => {
         const now = Date.now();
         for (const [sender, record] of aiCallCounts) {
             if (now - record.windowStart > 120000) aiCallCounts.delete(sender);
         }
-    }, 120000);
+    }, 120000));
 
     // ========== AI 对话记忆（每玩家多轮对话上下文） ==========
-    const CONVERSATION_TTL = 30 * 60 * 1000; // 30 分钟过期
+    const CONVERSATION_TTL = 15 * 60 * 1000; // 15 分钟过期
     const CONVERSATION_MAX_TURNS = 10; // 最多保留 10 轮对话（20 条消息）
+    const MAX_CONVERSATION_ENTRIES = 50; // 最多保留 50 个玩家的对话
+    const MAX_MESSAGE_LENGTH = 500; // 单条消息最大字符数（截断过长消息）
     const conversationMemory = new Map(); // sender -> { messages[], lastAccess }
 
     function getConversation(sender) {
@@ -1262,6 +1283,15 @@ bot.on('playerLeft', (player) => {
         let conv = conversationMemory.get(sender);
         if (!conv || now - conv.lastAccess > CONVERSATION_TTL) {
             conv = { messages: [], lastAccess: now };
+            // LRU 淘汰：超过上限时删除最久未访问的条目
+            if (conversationMemory.size >= MAX_CONVERSATION_ENTRIES && !conversationMemory.has(sender)) {
+                let oldestKey = null;
+                let oldestTime = Infinity;
+                for (const [k, v] of conversationMemory) {
+                    if (v.lastAccess < oldestTime) { oldestTime = v.lastAccess; oldestKey = k; }
+                }
+                if (oldestKey) conversationMemory.delete(oldestKey);
+            }
             conversationMemory.set(sender, conv);
         }
         conv.lastAccess = now;
@@ -1270,19 +1300,23 @@ bot.on('playerLeft', (player) => {
 
     function addToConversation(sender, role, content) {
         const conv = getConversation(sender);
-        conv.messages.push({ role, content });
+        // 截断过长消息，避免内存膨胀
+        const truncated = (typeof content === 'string' && content.length > MAX_MESSAGE_LENGTH)
+            ? content.slice(0, MAX_MESSAGE_LENGTH) + '...'
+            : content;
+        conv.messages.push({ role, content: truncated });
         if (conv.messages.length > CONVERSATION_MAX_TURNS * 2) {
             conv.messages = conv.messages.slice(-CONVERSATION_MAX_TURNS * 2);
         }
     }
 
-    // 定期清理过期的对话（每 5 分钟）
-    setInterval(() => {
+    // 定期清理过期的对话（每 2 分钟）
+    bot._intervals.push(setInterval(() => {
         const now = Date.now();
         for (const [sender, conv] of conversationMemory) {
-            if (now - conv.lastAccess > CONVERSATION_TTL + 300000) conversationMemory.delete(sender);
+            if (now - conv.lastAccess > CONVERSATION_TTL + 120000) conversationMemory.delete(sender);
         }
-    }, 300000);
+    }, 120000));
 
     async function handleAIChat(ctx) {
         // 频率限制检查
@@ -2267,34 +2301,33 @@ bot.on('playerLeft', (player) => {
 
             botMiningActive = true; // 必须先设置，否则扫描循环会立即退出
 
+            const HARD_MAX_BLOCKS = 20000;
             const blocks = [];
-            const scanMax = radius ? Math.ceil(radius * radius * (effectiveYMax - effectiveYMin) * 4) : 5000;
+            const scanMax = radius ? Math.min(Math.ceil(radius * radius * (effectiveYMax - effectiveYMin) * 4), HARD_MAX_BLOCKS) : Math.min(5000, HARD_MAX_BLOCKS);
 
             if (radius) {
                 // 半径模式：只扫描半径范围内的方块
-                for (let x = Math.floor(pos.x - radius); x <= Math.ceil(pos.x + radius); x++) {
-                    for (let z = Math.floor(pos.z - radius); z <= Math.ceil(pos.z + radius); z++) {
-                        for (let y = effectiveYMin; y <= effectiveYMax; y++) {
+                for (let x = Math.floor(pos.x - radius); x <= Math.ceil(pos.x + radius) && blocks.length < scanMax; x++) {
+                    for (let z = Math.floor(pos.z - radius); z <= Math.ceil(pos.z + radius) && blocks.length < scanMax; z++) {
+                        for (let y = effectiveYMin; y <= effectiveYMax && blocks.length < scanMax; y++) {
                             if (!botMiningActive) break;
-                            if (blocks.length >= scanMax) break;
                             const block = bot.blockAt(new Vec3(x, y, z));
                             if (!isMineableBlock(block)) continue;
                             const dist = pos.distanceTo(block.position);
-                            blocks.push({ block, dist, x, y, z });
+                            blocks.push({ x, y, z, dist });
                         }
                     }
                 }
             } else {
                 // 全区块模式
-                for (let x = bounds.minX; x <= bounds.maxX; x++) {
-                    for (let z = bounds.minZ; z <= bounds.maxZ; z++) {
-                        for (let y = effectiveYMin; y <= effectiveYMax; y++) {
+                for (let x = bounds.minX; x <= bounds.maxX && blocks.length < scanMax; x++) {
+                    for (let z = bounds.minZ; z <= bounds.maxZ && blocks.length < scanMax; z++) {
+                        for (let y = effectiveYMin; y <= effectiveYMax && blocks.length < scanMax; y++) {
                             if (!botMiningActive) break;
-                            if (blocks.length >= scanMax) break;
                             const block = bot.blockAt(new Vec3(x, y, z));
                             if (!isMineableBlock(block)) continue;
                             const dist = pos.distanceTo(block.position);
-                            blocks.push({ block, dist, x, y, z });
+                            blocks.push({ x, y, z, dist });
                         }
                     }
                 }
@@ -2352,7 +2385,7 @@ bot.on('playerLeft', (player) => {
             }
             botMiningActive = false;
         }, true, {
-            radius: { type: 'number', description: '挖掘半径（可选，不填则挖掘整个当前区块 16×16）', minimum: 1, maximum: 64, required: false },
+            radius: { type: 'number', description: '挖掘半径（可选，不填则挖掘整个当前区块 16×16）', minimum: 1, maximum: 16, required: false },
             yMin: { type: 'integer', description: 'Y 轴下限（可选，默认机器人脚下 -1）', required: false },
             yMax: { type: 'integer', description: 'Y 轴上限（可选，默认机器人头顶 +8）', required: false },
         });
