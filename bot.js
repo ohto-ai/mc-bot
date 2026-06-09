@@ -103,7 +103,6 @@ function startTpsMonitor(bot, options) {
     let lastAge = (bot.time && typeof bot.time.age !== 'undefined') ? Number(bot.time.age) : 0;
     let lastCheckTime = Date.now();
     let lastEmergencyShutdown = 0;
-    let warmupCycles = 2; // 跳过前 N 次有效测量，确保 TPS 数据稳定
 
     console.log(`${PREFIX} [TPS] 启动监控（阈值=${tpsThreshold}，间隔=${tpsCheckInterval}ms，冷却=${tpsCooldown}ms）`);
 
@@ -113,19 +112,9 @@ function startTpsMonitor(bot, options) {
         const ageDelta = currentAge - lastAge;
         const elapsed = (now - lastCheckTime) / 1000;
 
-        // 尚未收到 tick 更新（ageDelta <= 0）：跳过本轮，等待下一次检测
+        // 尚未收到 tick 更新：跳过本轮，重置时间基准
         if (ageDelta <= 0) {
-            lastCheckTime = now; // 重置时间基准，避免累积偏差
-            return;
-        }
-
-        // 预热期：刚启动时 TPS 数据可能不准确，跳过前几个周期
-        if (warmupCycles > 0) {
-            warmupCycles--;
-            lastAge = currentAge;
             lastCheckTime = now;
-            bot._lastTps = Math.round((ageDelta / elapsed) * 10) / 10;
-            console.log(`${PREFIX} [TPS] 预热中 (${2 - warmupCycles}/2): ${bot._lastTps}（跳过判断）`);
             return;
         }
 
@@ -1166,16 +1155,18 @@ function createBotInstance(config, options = {}) {
             }, 2000);
         }
 
-        // ---- 首次 spawn 时启动 TPS 监控 ----
+        // ---- 首次 spawn 时延迟 10 秒启动 TPS 监控（等待 tick 数据稳定） ----
         if (spawnCount === 1) {
             if (!bot._tpsMonitorCleanup) {
-                bot._tpsMonitorCleanup = startTpsMonitor(bot, {
-                    tpsThreshold: bot._tpsThreshold,
-                    tpsCheckInterval: bot._tpsCheckInterval,
-                    tpsCooldown: bot._tpsCooldown,
-                    emergencyShutdown: options.emergencyShutdown || null,
-                    PREFIX,
-                });
+                setTimeout(() => {
+                    bot._tpsMonitorCleanup = startTpsMonitor(bot, {
+                        tpsThreshold: bot._tpsThreshold,
+                        tpsCheckInterval: bot._tpsCheckInterval,
+                        tpsCooldown: bot._tpsCooldown,
+                        emergencyShutdown: options.emergencyShutdown || null,
+                        PREFIX,
+                    });
+                }, 10000);
             }
         }
     });
