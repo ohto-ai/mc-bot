@@ -103,6 +103,7 @@ function startTpsMonitor(bot, options) {
     let lastAge = (bot.time && typeof bot.time.age !== 'undefined') ? Number(bot.time.age) : 0;
     let lastCheckTime = Date.now();
     let lastEmergencyShutdown = 0;
+    let warmupCycles = 2; // 跳过前 N 次有效测量，确保 TPS 数据稳定
 
     console.log(`${PREFIX} [TPS] 启动监控（阈值=${tpsThreshold}，间隔=${tpsCheckInterval}ms，冷却=${tpsCooldown}ms）`);
 
@@ -111,7 +112,24 @@ function startTpsMonitor(bot, options) {
         const currentAge = (bot.time && typeof bot.time.age !== 'undefined') ? Number(bot.time.age) : lastAge;
         const ageDelta = currentAge - lastAge;
         const elapsed = (now - lastCheckTime) / 1000;
-        const tps = elapsed > 0 ? ageDelta / elapsed : 20;
+
+        // 尚未收到 tick 更新（ageDelta <= 0）：跳过本轮，等待下一次检测
+        if (ageDelta <= 0) {
+            lastCheckTime = now; // 重置时间基准，避免累积偏差
+            return;
+        }
+
+        // 预热期：刚启动时 TPS 数据可能不准确，跳过前几个周期
+        if (warmupCycles > 0) {
+            warmupCycles--;
+            lastAge = currentAge;
+            lastCheckTime = now;
+            bot._lastTps = Math.round((ageDelta / elapsed) * 10) / 10;
+            console.log(`${PREFIX} [TPS] 预热中 (${2 - warmupCycles}/2): ${bot._lastTps}（跳过判断）`);
+            return;
+        }
+
+        const tps = ageDelta / elapsed;
         bot._lastTps = Math.round(tps * 10) / 10; // 保留 1 位小数
 
         if (tps < tpsThreshold) {
