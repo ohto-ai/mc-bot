@@ -22,9 +22,6 @@
     "auto_login": true,
     "default_server": "",
     "max_pay_amount": 100000,
-    "tps_threshold": 16,
-    "tps_check_interval": 5000,
-    "tps_cooldown": 30000,
     "tp_reply": "收到你的传送请求~"
   },
   "bots": [

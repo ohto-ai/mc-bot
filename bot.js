@@ -86,68 +86,6 @@ async function queryMiMo(userMessage, systemPrompt, aiCfg) {
     }
 }
 
-// ========== TPS 监控（每 bot 独立） ==========
-
-// 启动 TPS 监控，返回 cleanup 函数
-// options: { tpsThreshold, tpsCheckInterval, tpsCooldown, emergencyShutdown, PREFIX }
-function startTpsMonitor(bot, options) {
-    const {
-        tpsThreshold, tpsCheckInterval, tpsCooldown, emergencyShutdown, PREFIX
-    } = options;
-
-    if (!tpsThreshold || tpsThreshold <= 0) {
-        console.log(`${PREFIX} [TPS] 监控已禁用（阈值=${tpsThreshold}）`);
-        return () => {};
-    }
-
-    let lastAge = (bot.time && typeof bot.time.age !== 'undefined') ? Number(bot.time.age) : 0;
-    let lastCheckTime = Date.now();
-    let lastEmergencyShutdown = 0;
-
-    console.log(`${PREFIX} [TPS] 启动监控（阈值=${tpsThreshold}，间隔=${tpsCheckInterval}ms，冷却=${tpsCooldown}ms）`);
-
-    const interval = setInterval(() => {
-        const now = Date.now();
-        const currentAge = (bot.time && typeof bot.time.age !== 'undefined') ? Number(bot.time.age) : lastAge;
-        const ageDelta = currentAge - lastAge;
-        const elapsed = (now - lastCheckTime) / 1000;
-
-        // 尚未收到 tick 更新：跳过本轮，重置时间基准
-        if (ageDelta <= 0) {
-            lastCheckTime = now;
-            return;
-        }
-
-        const tps = ageDelta / elapsed;
-        bot._lastTps = Math.round(tps * 10) / 10; // 保留 1 位小数
-
-        if (tps < tpsThreshold) {
-            const timeSinceLastShutdown = now - lastEmergencyShutdown;
-            if (timeSinceLastShutdown > tpsCooldown && emergencyShutdown) {
-                console.log(`${PREFIX} [TPS] ⚠️ TPS 过低 (${bot._lastTps} < ${tpsThreshold})，触发紧急下线！`);
-                lastEmergencyShutdown = now;
-                bot._lastEmergencyShutdown = now;
-                emergencyShutdown(`TPS 过低: ${bot._lastTps} < ${tpsThreshold}`);
-            }
-        }
-
-        // 重置计数器
-        lastAge = currentAge;
-        lastCheckTime = now;
-    }, tpsCheckInterval);
-
-    return () => clearInterval(interval);
-}
-
-// 重启 TPS 监控（参数变更后调用）
-function restartTpsMonitor(bot, options) {
-    if (bot._tpsMonitorCleanup) {
-        bot._tpsMonitorCleanup();
-        bot._tpsMonitorCleanup = null;
-    }
-    bot._tpsMonitorCleanup = startTpsMonitor(bot, options);
-}
-
 // ========== Buddy Watch 链式传播检查 ==========
 // 当 bot 下线时，检查是否有其他 bot 在监视它，触发链式下线
 function checkBuddyWatchChain(myName, myUsername, botRegistry) {
@@ -184,9 +122,6 @@ function createBotInstance(config, options = {}) {
         auto_login: autoLogin,
         default_server: defaultServer,
         tp_reply: tpReply,
-        tps_threshold: tpsThreshold = 16,
-        tps_check_interval: tpsCheckInterval = 5000,
-        tps_cooldown: tpsCooldown = 30000,
         buddy_watch: buddyWatch = null,
     } = config;
 
@@ -234,15 +169,9 @@ function createBotInstance(config, options = {}) {
         skipValidation: true,
     });
 
-    // ---- 安全保险：初始化 TPS 监控 & Buddy Watch 运行时变量 ----
+    // ---- 安全保险：初始化 Buddy Watch 运行时变量 ----
     bot._botName = botName;
     bot._buddyWatch = buddyWatch || null;
-    bot._tpsThreshold = tpsThreshold;
-    bot._tpsCheckInterval = tpsCheckInterval;
-    bot._tpsCooldown = tpsCooldown;
-    bot._lastTps = 20; // 初始假设满 TPS
-    bot._tpsMonitorCleanup = null;
-    bot._lastEmergencyShutdown = 0;
     bot._intervals = []; // 收集所有 setInterval ID，断线时统一清理
 
     // ---- 调试日志：监听所有关键事件 ----
@@ -1018,11 +947,6 @@ function createBotInstance(config, options = {}) {
 
     bot.on('end', (reason) => {
         console.log(`${PREFIX} [断开] 连接断开: ${reason}`);
-        // 清理 TPS 监控定时器
-        if (bot._tpsMonitorCleanup) {
-            bot._tpsMonitorCleanup();
-            bot._tpsMonitorCleanup = null;
-        }
         // 清理 activateItem 定时器
         if (bot.activateItemInterval) {
             clearInterval(bot.activateItemInterval);
@@ -1153,21 +1077,6 @@ function createBotInstance(config, options = {}) {
                     console.error(`${PREFIX} [服务器] 自动切换失败: ${err}`);
                 }
             }, 2000);
-        }
-
-        // ---- 首次 spawn 时延迟 10 秒启动 TPS 监控（等待 tick 数据稳定） ----
-        if (spawnCount === 1) {
-            if (!bot._tpsMonitorCleanup) {
-                setTimeout(() => {
-                    bot._tpsMonitorCleanup = startTpsMonitor(bot, {
-                        tpsThreshold: bot._tpsThreshold,
-                        tpsCheckInterval: bot._tpsCheckInterval,
-                        tpsCooldown: bot._tpsCooldown,
-                        emergencyShutdown: options.emergencyShutdown || null,
-                        PREFIX,
-                    });
-                }, 10000);
-            }
         }
     });
 
@@ -3200,92 +3109,6 @@ bot.on('playerLeft', (player) => {
             message: { type: 'string', description: '自定义 AFK 消息（可选）', required: false },
         });
 
-    // ---- TPS 监控命令 ----
-
-    cmd('/tps', ['/tps'],
-        TRIGGER.WHISPER | TRIGGER.WEB | TRIGGER.QQ_AT,
-        TARGET.TRUSTED,
-        '/tps — 查询当前 TPS 值及阈值设置',
-        (ctx, args) => {
-            const subCmd = args.trim().toLowerCase();
-            if (!subCmd) {
-                // 查询当前 TPS
-                const status = bot._tpsThreshold > 0 ? '启用' : '禁用';
-                const lines = [
-                    `[TPS] 当前 TPS: ${bot._lastTps}（${status}）`,
-                    `  阈值: ${bot._tpsThreshold}（低于此值自动全部下线）`,
-                    `  检测间隔: ${bot._tpsCheckInterval}ms`,
-                    `  冷却时间: ${bot._tpsCooldown}ms`,
-                ];
-                ctx.reply(lines.join('\n'));
-                return;
-            }
-
-            if (subCmd.startsWith('threshold ')) {
-                const val = parseFloat(subCmd.slice('threshold '.length));
-                if (isNaN(val) || val < 0) { ctx.reply('[TPS] 用法: /tps threshold <数字>（0=禁用监控）'); return; }
-                bot._tpsThreshold = val;
-                restartTpsMonitor(bot, {
-                    tpsThreshold: bot._tpsThreshold,
-                    tpsCheckInterval: bot._tpsCheckInterval,
-                    tpsCooldown: bot._tpsCooldown,
-                    emergencyShutdown: options.emergencyShutdown || null,
-                    PREFIX,
-                });
-                ctx.reply(`[TPS] 阈值已设为 ${val}${val === 0 ? '（监控已禁用）' : ''}`);
-                return;
-            }
-
-            if (subCmd.startsWith('interval ')) {
-                const val = parseInt(subCmd.slice('interval '.length));
-                if (isNaN(val) || val < 1000) { ctx.reply('[TPS] 用法: /tps interval <毫秒数>（最少 1000ms）'); return; }
-                bot._tpsCheckInterval = val;
-                restartTpsMonitor(bot, {
-                    tpsThreshold: bot._tpsThreshold,
-                    tpsCheckInterval: bot._tpsCheckInterval,
-                    tpsCooldown: bot._tpsCooldown,
-                    emergencyShutdown: options.emergencyShutdown || null,
-                    PREFIX,
-                });
-                ctx.reply(`[TPS] 检测间隔已设为 ${val}ms`);
-                return;
-            }
-
-            if (subCmd.startsWith('cooldown ')) {
-                const val = parseInt(subCmd.slice('cooldown '.length));
-                if (isNaN(val) || val < 0) { ctx.reply('[TPS] 用法: /tps cooldown <毫秒数>'); return; }
-                bot._tpsCooldown = val;
-                ctx.reply(`[TPS] 冷却时间已设为 ${val}ms`);
-                return;
-            }
-
-            if (subCmd === 'monitor on') {
-                if (bot._tpsThreshold <= 0) bot._tpsThreshold = 16;
-                restartTpsMonitor(bot, {
-                    tpsThreshold: bot._tpsThreshold,
-                    tpsCheckInterval: bot._tpsCheckInterval,
-                    tpsCooldown: bot._tpsCooldown,
-                    emergencyShutdown: options.emergencyShutdown || null,
-                    PREFIX,
-                });
-                ctx.reply(`[TPS] 监控已启用（阈值=${bot._tpsThreshold}）`);
-                return;
-            }
-
-            if (subCmd === 'monitor off') {
-                if (bot._tpsMonitorCleanup) {
-                    bot._tpsMonitorCleanup();
-                    bot._tpsMonitorCleanup = null;
-                }
-                bot._tpsThreshold = 0;
-                console.log(`${PREFIX} [TPS] 监控已手动禁用`);
-                ctx.reply('[TPS] 监控已禁用');
-                return;
-            }
-
-            ctx.reply('[TPS] 未知子命令。可用: threshold/interval/cooldown/monitor on/monitor off');
-        });
-
     // ---- Buddy Watch 命令 ----
 
     cmd('/buddy', ['/buddy'],
@@ -3400,24 +3223,6 @@ if (require.main === module) {
     // 机器人实例注册表（username_lowercase -> bot 实例）
     const botRegistry = new Map();
 
-    // TPS 紧急下线回调（全局，所有 bot 共享）
-    function emergencyShutdown(reason) {
-        console.log(`[主进程] ⚠️ 紧急下线触发！原因: ${reason}`);
-        console.log(`[主进程] 正在下线所有机器人...`);
-        let count = 0;
-        for (const [key, b] of botRegistry) {
-            try {
-                console.log(`[主进程] 下线: ${b._botName || b.username}`);
-                b.end();
-                count++;
-            } catch (e) {
-                console.error(`[主进程] 下线 ${key} 失败:`, e.message);
-            }
-        }
-        botRegistry.clear();
-        console.log(`[主进程] 已下线 ${count} 个机器人`);
-    }
-
     // 持久化配置到 config.json
     function saveBotsConfig() {
         try {
@@ -3453,7 +3258,6 @@ if (require.main === module) {
             saveBotsConfig,
             spawnBotFromConfig,
             aiCfg,
-            emergencyShutdown,
         });
         botRegistry.set(lowerUser, bot);
         return null; // null 表示成功
@@ -3485,7 +3289,6 @@ if (require.main === module) {
             saveBotsConfig,
             spawnBotFromConfig,
             aiCfg,
-            emergencyShutdown,
         });
         botRegistry.set((merged.username || '').toLowerCase(), bot);
     }
