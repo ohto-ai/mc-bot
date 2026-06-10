@@ -123,7 +123,12 @@ function createBotInstance(config, options = {}) {
         default_server: defaultServer,
         tp_reply: tpReply,
         buddy_watch: buddyWatch = null,
+        view_distance: viewDistanceCfg,
     } = config;
+
+    // 视图距离：支持字符串 ("tiny"/"short"/"medium"/"far") 或数字 (2-32)
+    // 默认 "tiny" = 2 区块半径（5x5=25 区块），大幅减少服务器区块加载开销
+    const viewDistance = viewDistanceCfg || 'tiny';
 
     // 为每个 bot 实例注入独立的身份信息，防止多 bot 之间身份混淆
     const systemPrompt = _systemPrompt
@@ -166,6 +171,7 @@ function createBotInstance(config, options = {}) {
         port,
         username,
         version,
+        viewDistance,
         skipValidation: true,
     });
 
@@ -2928,6 +2934,103 @@ bot.on('playerLeft', (player) => {
             const maxOxygen = 300; // 默认最大氧气值（15秒 × 20 ticks）
             const pct = Math.round((oxygen / maxOxygen) * 100);
             ctx.reply(`[氧气] 剩余氧气: ${oxygen}/${maxOxygen} (${pct}%)`);
+        }, true);
+
+    // ========== 视图距离控制 ==========
+
+    // 视图距离等级映射
+    const VIEW_DISTANCE_LEVELS = {
+        'tiny': 2, 'short': 4, 'medium': 8, 'far': 16, 'extreme': 32,
+    };
+
+    // 将视图距离值转换为友好名称
+    function getViewDistanceName(vd) {
+        for (const [name, val] of Object.entries(VIEW_DISTANCE_LEVELS)) {
+            if (val === vd) return name;
+        }
+        return String(vd);
+    }
+
+    // 尝试实时更新视图距离（发送 client_information 包通知服务器）
+    function applyViewDistance(newVD) {
+        const numeric = typeof newVD === 'string' ? (VIEW_DISTANCE_LEVELS[newVD.toLowerCase()] || parseInt(newVD)) : newVD;
+        if (isNaN(numeric) || numeric < 2 || numeric > 32) return false;
+
+        // 更新 mineflayer 内部记录
+        if (bot.settings) {
+            bot.settings.viewDistance = numeric;
+        }
+
+        // 向服务器发送更新后的客户端设置
+        try {
+            // 获取当前语言环境（尽量保留原值）
+            const locale = bot.settings?.locale || 'zh_CN';
+            const chatMode = bot.settings?.chatMode ?? 0;
+            const chatColors = bot.settings?.chatColors ?? true;
+            const displayedSkinParts = bot.settings?.displayedSkinParts ?? 0xff;
+            const mainHand = bot.settings?.mainHand ?? 1;
+            const enableTextFiltering = bot.settings?.enableTextFiltering ?? false;
+            const allowServerListings = bot.settings?.allowServerListings ?? true;
+
+            bot._client.write('client_information', {
+                locale,
+                viewDistance: numeric,
+                chatMode,
+                chatColors,
+                displayedSkinParts,
+                mainHand,
+                enableTextFiltering,
+                allowServerListings,
+            });
+            return true;
+        } catch (err) {
+            console.error(`${PREFIX} [视图] 发送 client_information 失败:`, err.message);
+            return false;
+        }
+    }
+
+    cmd('/viewdistance', ['/viewdistance', '/vd', '/renderdistance', '/rd'],
+        TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT | TRIGGER.WEB,
+        TARGET.TRUSTED,
+        '/viewdistance [tiny|short|medium|far|2-32] — 查看或设置 bot 视图距离（越小加载区块越少，服务器压力越低）',
+        (ctx, args) => {
+            const currentVD = bot.settings?.viewDistance ?? viewDistance;
+            const currentName = getViewDistanceName(currentVD);
+            // 当前区块加载数：视图距离为 d 时，加载 (2d+1)² 个区块
+            const curNumeric = typeof currentVD === 'string' ? (VIEW_DISTANCE_LEVELS[currentVD.toLowerCase()] || parseInt(currentVD)) : currentVD;
+            const chunkCount = isNaN(curNumeric) ? '?' : (2 * curNumeric + 1) ** 2;
+
+            if (!args || !args.trim()) {
+                // 无参数：显示当前设置
+                const levels = Object.entries(VIEW_DISTANCE_LEVELS)
+                    .map(([name, val]) => {
+                        const chunks = (2 * val + 1) ** 2;
+                        return `${name}(${val}区块=${chunks}个)`;
+                    })
+                    .join(' / ');
+                ctx.reply(`[视图距离] 当前: ${currentName} (${curNumeric} 区块半径 ≈ ${chunkCount} 个区块加载)\n可用等级: ${levels}\n用法: /viewdistance <等级或数字> 来修改`);
+                return;
+            }
+
+            const input = args.trim().toLowerCase();
+            let newVD = VIEW_DISTANCE_LEVELS[input] || parseInt(input);
+
+            if (isNaN(newVD) || newVD < 2 || newVD > 32) {
+                ctx.reply(`[视图距离] 无效值 "${args.trim()}"。可用: tiny(2)/short(4)/medium(8)/far(16)/extreme(32) 或直接 2-32 的数字`);
+                return;
+            }
+
+            const newName = getViewDistanceName(newVD);
+            const newChunks = (2 * newVD + 1) ** 2;
+
+            // 尝试实时应用
+            const applied = applyViewDistance(newVD);
+            if (applied) {
+                const oldChunks = (2 * curNumeric + 1) ** 2;
+                ctx.reply(`[视图距离] 已从 ${currentName}(${oldChunks}区块) 更新为 ${newName}(${newChunks}区块)\n⚠ 注意：实时更新后服务器可能需要几秒重新计算区块。如需完全生效，建议重启 bot。`);
+            } else {
+                ctx.reply(`[视图距离] 无法实时更新，请修改 config.json 中 defaults.view_distance 为 "${newName}" 后重启 bot。`);
+            }
         }, true);
 
     // ========== Residence 插件命令 ==========
