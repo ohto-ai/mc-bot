@@ -415,6 +415,27 @@ function createBotInstance(config, options = {}) {
     let craftStationConfigPos = null;   // 手动坐标配置 { source: Vec3, dest: Vec3 }（可选扩展）
     let craftStationAwaitingWindow = false; // 等待 windowOpen 事件
 
+    // ========== 洗潜影盒自动化状态 ==========
+    let washStationActive = false;
+    let washStationState = 'IDLE';          // IDLE → PREFLIGHT → CAULDRON_CHECK → WITHDRAW → WASH → DEPOSIT → TRANSFER_UNDYED → CHECK → ...
+    let washStationWaterPos = null;         // A: 无限水源坐标 Vec3
+    let washStationCauldronPos = null;      // B: 炼药锅坐标 Vec3
+    let washStationBucketPos = null;        // C: 水桶/空桶容器坐标 Vec3
+    let washStationDyedPos = null;          // D: 染色盒子容器坐标 Vec3
+    let washStationUndyedPos = null;        // E: 无色盒子容器坐标 Vec3
+    let washStationSender = '';
+    let washStationRetries = 0;
+    let washStationLoopTimer = null;
+    let washStationCycles = 0;              // 0 = infinite
+    let washStationCycleCount = 0;
+    let washStationTotalWashed = 0;         // 累计已洗盒子数
+    let washStationPendingStop = false;
+    let washStationCauldronLevel = 0;       // 炼药锅水位缓存 (0-3)
+    let washStationLogCycleCounter = 0;
+    let washStationStartTime = 0;
+    let washStationSubState = '';           // 预检子状态
+    let washStationSourceDepleted = false;  // D容器已耗尽（无染色盒也无无色盒）
+
     // ========== 挖掘工具匹配系统 ==========
 
     // 工具材质等级（数字越大越好）
@@ -613,6 +634,136 @@ function createBotInstance(config, options = {}) {
     function isShulkerBox(name) {
         if (!name) return false;
         return name.endsWith('_shulker_box') || name === 'shulker_box';
+    }
+
+    /** 判断是否为染色潜影盒（排除无色潜影盒） */
+    function isDyedShulkerBox(name) {
+        if (!name) return false;
+        return name.endsWith('_shulker_box') && name !== 'shulker_box';
+    }
+
+    /** 判断物品名是否为无色潜影盒 */
+    function isUndyedShulkerBox(name) {
+        return name === 'shulker_box';
+    }
+
+    /** 判断物品是否为水桶 */
+    function isWaterBucket(name) {
+        return name === 'water_bucket';
+    }
+
+    /** 判断物品是否为空桶 */
+    function isEmptyBucket(name) {
+        return name === 'bucket';
+    }
+
+    /** 获取炼药锅水位（0-3），若方块不是炼药锅则返回 -1 */
+    function getCauldronWaterLevel(pos, debug = false) {
+        if (!pos) return -1;
+        const block = bot.blockAt(pos);
+        if (!block) {
+            if (debug) console.log(`${PREFIX} [洗盒-诊断] bot.blockAt(${pos.x},${pos.y},${pos.z}) 返回 null——区块未加载或坐标错误`);
+            return -1;
+        }
+        const name = (block.name || '').toLowerCase();
+        // 兼容带命名空间前缀的情况（如 minecraft:water_cauldron）
+        if (name === 'water_cauldron' || name.endsWith(':water_cauldron') || name === 'cauldron') {
+            // 尝试多种途径获取 level
+            let level = null;
+            // 途径1: properties.level（mineflayer 标准）
+            if (block.properties?.level !== undefined) {
+                level = parseInt(block.properties.level);
+            }
+            // 途径2: getProperties() 方法（某些 mineflayer 版本）
+            if ((level === null || isNaN(level)) && typeof block.getProperties === 'function') {
+                const props = block.getProperties();
+                if (props?.level !== undefined) level = parseInt(props.level);
+            }
+            // 途径3: metadata（旧版兼容）
+            if ((level === null || isNaN(level)) && block.metadata !== undefined) {
+                level = block.metadata;
+            }
+            if (level !== null && !isNaN(level) && level >= 0 && level <= 3) {
+                if (debug) console.log(`${PREFIX} [洗盒-诊断] 炼药锅水位: ${level}/3 (name=${block.name})`);
+                return level;
+            }
+            // water_cauldron 但读不到 level，默认认为有 1 格水
+            if (name === 'water_cauldron' || name.endsWith(':water_cauldron')) {
+                if (debug) console.log(`${PREFIX} [洗盒-诊断] water_cauldron 但读不到 level，默认=1 (props=${JSON.stringify(block.properties)}, meta=${block.metadata})`);
+                return 1;
+            }
+            // 普通 cauldron
+            if (debug) console.log(`${PREFIX} [洗盒-诊断] 空炼药锅 (name=${block.name})`);
+            return 0;
+        }
+        if (name === 'lava_cauldron' || name === 'powder_snow_cauldron' || name.endsWith(':lava_cauldron') || name.endsWith(':powder_snow_cauldron')) {
+            if (debug) console.log(`${PREFIX} [洗盒-诊断] 炼药锅装了其他液体: ${block.name}`);
+            return -2;
+        }
+        if (debug) console.log(`${PREFIX} [洗盒-诊断] 方块 ${block.name} 不是炼药锅`);
+        return -1;
+    }
+
+    /** 判断方块是否为水源（水方块或含水方块） */
+    function isWaterSourceBlock(block) {
+        if (!block) return false;
+        const name = (block.name || '').toLowerCase();
+        // 水方块
+        if (name === 'water') return true;
+        // 含水方块（waterlogged）：mineflayer 返回的 properties 值可能是字符串 "true" 或布尔 true
+        const wl = block.properties?.waterlogged;
+        if (wl === 'true' || wl === true || wl === 1) return true;
+        return false;
+    }
+
+    /** 在指定坐标附近搜索水源方块（半径内），返回最近的一个，没找到返回 null */
+    function findNearbyWater(centerPos, radius = 5) {
+        if (!centerPos) return null;
+        const cx = centerPos.x, cy = centerPos.y, cz = centerPos.z;
+        let bestBlock = null, bestDist = Infinity;
+        for (let dx = -radius; dx <= radius; dx++) {
+            for (let dy = -2; dy <= 2; dy++) {
+                for (let dz = -radius; dz <= radius; dz++) {
+                    const pos = centerPos.offset(dx, dy, dz);
+                    const block = bot.blockAt(pos);
+                    if (block && isWaterSourceBlock(block)) {
+                        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            bestBlock = block;
+                        }
+                    }
+                }
+            }
+        }
+        return bestBlock;
+    }
+
+    /** 根据配置坐标查找方块，返回 block 或 null */
+    function getBlockAtConfigPos(pos, expectedType) {
+        if (!pos) return null;
+        const block = bot.blockAt(pos);
+        if (!block) return null;
+        if (expectedType) {
+            const name = (block.name || '').toLowerCase();
+            if (expectedType === 'water') return isWaterSourceBlock(block);
+            if (expectedType === 'cauldron') return name.includes('cauldron');
+            if (expectedType === 'container') return isContainerBlock(name);
+        }
+        return block;
+    }
+
+    /** 检查容器是否有空间（粗略检测：是否至少有一个空槽位） */
+    function containerHasSpace(window) {
+        const invStart = window.inventoryStart ?? 0;
+        const slots = window.slots ?? [];
+        const end = Math.min(slots.length, invStart > 0 ? invStart : slots.length);
+        // 实际容器槽位从 0 到 inventoryStart-1（如果 inventoryStart > 0）
+        const containerEnd = invStart > 0 ? invStart : end;
+        for (let i = 0; i < containerEnd; i++) {
+            if (!slots[i]) return true; // 有空槽
+        }
+        return false;
     }
 
     /** 找附近工作台（优先缓存位置，其次相对探测，最后全图搜索） */
@@ -1183,6 +1334,8 @@ function createBotInstance(config, options = {}) {
         }
         // 清理合成站
         if (craftStationActive) cleanupStation();
+        // 清理洗盒站
+        if (washStationActive) cleanupWashStation();
         // 清理所有收集的 setInterval（AI 频率记录、对话记忆清理等）
         for (const id of bot._intervals) {
             clearInterval(id);
@@ -2462,6 +2615,1029 @@ bot.on('playerLeft', (player) => {
         }
         craftStationState = 'FIND_CHESTS';
         scheduleTick(500);
+    }
+
+    // ================================================================
+    //  洗潜影盒自动化
+    // ================================================================
+
+    /** 洗盒专用走向目标（独立于采矿状态） */
+    function walkToWashTarget(targetPos, minDist = 3.0) {
+        return new Promise((resolve) => {
+            if (!targetPos) return resolve(false);
+            const maxTime = 25000;
+            const startTime = Date.now();
+
+            const stopMove = () => {
+                for (const ctrl of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+                    bot.setControlState(ctrl, false);
+                }
+            };
+
+            function step() {
+                if (!washStationActive) { stopMove(); return resolve(false); }
+
+                const myPos = bot.entity.position;
+                const dist = myPos.distanceTo(targetPos);
+                if (dist <= minDist) { stopMove(); return resolve(true); }
+
+                if (Date.now() - startTime > maxTime) { stopMove(); return resolve(false); }
+
+                const dx = targetPos.x - myPos.x;
+                const dz = targetPos.z - myPos.z;
+                const horizDist = Math.sqrt(dx * dx + dz * dz);
+                if (horizDist > 0.3) {
+                    bot.lookAt(targetPos.offset(0, 0.5, 0), false);
+                }
+
+                bot.setControlState('forward', true);
+                if (dist > 6) bot.setControlState('sprint', true);
+                else bot.setControlState('sprint', false);
+
+                setTimeout(step, 150);
+            }
+
+            step();
+        });
+    }
+
+    /** 确保靠近目标位置 */
+    async function ensureNearPos(pos, label, minDist = 3.5) {
+        if (!pos) { console.error(`${PREFIX} [洗盒] ${label} 坐标未配置`); return false; }
+        const dist = bot.entity.position.distanceTo(pos);
+        if (dist <= minDist) return true;
+        console.log(`${PREFIX} [洗盒] 距离 ${label} 约 ${dist.toFixed(1)} 格，走过去...`);
+        const ok = await walkToWashTarget(pos, minDist);
+        if (!ok) {
+            console.log(`${PREFIX} [洗盒] 无法到达 ${label} @ (${pos.x}, ${pos.y}, ${pos.z})，距离 ${dist.toFixed(1)} 格`);
+        }
+        return ok;
+    }
+
+    /** 在炼药锅上执行一次交互（需先装备好手中物品） */
+    async function interactCauldron() {
+        const cauldronBlock = bot.blockAt(washStationCauldronPos);
+        if (!cauldronBlock) throw new Error('炼药锅方块不存在');
+        // 检查手持物品
+        const held = bot.heldItem;
+        if (!held) {
+            console.log(`${PREFIX} [洗盒] interactCauldron: 手上无物品，跳过`);
+            throw new Error('手上无物品，无法与炼药锅交互');
+        }
+        if (!isWaterBucket(held.name) && !isDyedShulkerBox(held.name)) {
+            console.log(`${PREFIX} [洗盒] interactCauldron: 手上物品不是水桶或染色盒子 (${held.name})，跳过`);
+            throw new Error(`手上物品 ${held.name} 不能与炼药锅交互`);
+        }
+        const levelBefore = getCauldronWaterLevel(washStationCauldronPos);
+        // 确保视角朝向炼药锅（增加成功率）
+        bot.lookAt(washStationCauldronPos.offset(0.5, 0.5, 0.5), true);
+        await sleep(150);
+        bot.activateBlock(cauldronBlock);
+        await sleep(500); // 等待服务端处理 + 区块更新
+        // 验证交互结果
+        const levelAfter = getCauldronWaterLevel(washStationCauldronPos, true);
+        console.log(`${PREFIX} [洗盒] 炼药锅交互: ${cauldronBlock.name} 水位 ${levelBefore}→${levelAfter} (手持: ${held.name})`);
+    }
+
+    /** 与水方块交互（填充空桶），支持水源方块和含水方块。返回 true=成功装水 */
+    async function interactWaterSource() {
+        // 记录交互前手持物品
+        const heldBefore = bot.heldItem;
+        if (!heldBefore) throw new Error('手上没有物品，无法装水');
+        if (!isEmptyBucket(heldBefore.name)) {
+            console.log(`${PREFIX} [洗盒] 手上不是空桶 (${heldBefore.name})，无法装水`);
+            return false;
+        }
+
+        // 确定实际用水源方块 — 指定坐标 + 附近搜索回退
+        let waterBlock = bot.blockAt(washStationWaterPos);
+        const configuredBlock = waterBlock;
+        if (!waterBlock || !isWaterSourceBlock(waterBlock)) {
+            if (configuredBlock) {
+                console.log(`${PREFIX} [洗盒] 指定水源坐标 "${configuredBlock.name}" 不是水源 (props=${JSON.stringify(configuredBlock.properties || {})})，搜索附近水源...`);
+            } else {
+                console.log(`${PREFIX} [洗盒] 指定水源坐标无方块，搜索附近水源...`);
+            }
+            const nearby = findNearbyWater(washStationWaterPos, 5);
+            if (nearby) {
+                console.log(`${PREFIX} [洗盒] 在附近 (${nearby.position.x}, ${nearby.position.y}, ${nearby.position.z}) 找到水源: ${nearby.name}`);
+                waterBlock = nearby;
+            } else {
+                console.log(`${PREFIX} [洗盒] 指定坐标半径5格内未找到水源方块，请用 -water 指定正确的水源坐标`);
+                return false;
+            }
+        }
+
+        const waterPos = waterBlock.position;
+        const myPos = bot.entity.position;
+        const dist = myPos.distanceTo(waterPos);
+        console.log(`${PREFIX} [洗盒] 水源方块: ${waterBlock.name} @ (${waterPos.x},${waterPos.y},${waterPos.z})，bot距离 ${dist.toFixed(1)} 格`);
+
+        // 如果距离超过4格，走近水源
+        if (dist > 3.5) {
+            console.log(`${PREFIX} [洗盒] 距离水源 ${dist.toFixed(1)} 格，走过去...`);
+            if (!(await walkToWashTarget(waterPos, 2.0))) {
+                console.log(`${PREFIX} [洗盒] 无法走到水源旁边`);
+                return false;
+            }
+            // 重新获取方块引用（走过之后引用可能失效）
+            waterBlock = bot.blockAt(waterPos);
+            if (!waterBlock) {
+                console.log(`${PREFIX} [洗盒] 走到水源旁后找不到方块了`);
+                return false;
+            }
+        }
+
+        // 尝试交互 — 看水源方块的面
+        bot.lookAt(waterPos.offset(0.5, 0.5, 0.5), true);
+        await sleep(200);
+        console.log(`${PREFIX} [洗盒] 右键水源方块: ${waterBlock.name}`);
+        bot.activateBlock(waterBlock);
+        await sleep(500);
+
+        // 验证手持物品是否变成水桶
+        let heldAfter = bot.heldItem;
+        if (heldAfter && isWaterBucket(heldAfter.name)) {
+            console.log(`${PREFIX} [洗盒] 装水成功: 空桶 → 水桶 (水源: ${waterBlock.name} @ ${waterPos.x},${waterPos.y},${waterPos.z})`);
+            return true;
+        }
+
+        // 第一次没成功，回退：尝试 activateItem（有些服务器/版本需要这种方式）
+        console.log(`${PREFIX} [洗盒] activateBlock 未成功 (手持=${heldAfter ? heldAfter.name : '空手'})，尝试 activateItem...`);
+        // 重新装备空桶确保手持正确
+        const emptyInInv = bot.inventory.items().find(i => isEmptyBucket(i.name));
+        if (emptyInInv) {
+            await bot.equip(emptyInInv, 'hand');
+            await sleep(200);
+        }
+        bot.lookAt(waterPos.offset(0.5, 0.5, 0.5), true);
+        await sleep(150);
+        bot.activateItem();  // 某些情况需要 activateItem 而不是 activateBlock
+        await sleep(500);
+
+        heldAfter = bot.heldItem;
+        if (heldAfter && isWaterBucket(heldAfter.name)) {
+            console.log(`${PREFIX} [洗盒] activateItem 装水成功: 空桶 → 水桶`);
+            return true;
+        }
+
+        // 装水失败
+        console.log(`${PREFIX} [洗盒] 装水失败: activateBlock + activateItem 都未成功。交互前=${heldBefore.name}，最终手持=${heldAfter ? heldAfter.name : '空手'}`);
+        return false;
+    }
+
+    // ---- 洗盒预检 ----
+
+    async function runWashPreflight() {
+        if (!bot.entity) return;
+        const logParts = [];
+
+        // Step 1: 检查背包是否有无色盒子 → 存入 E
+        let undyedItems = bot.inventory.items().filter(i => isUndyedShulkerBox(i.name));
+        if (undyedItems.length > 0) {
+            const total = undyedItems.reduce((s, i) => s + i.count, 0);
+            console.log(`${PREFIX} [洗盒-预检] 背包有 ${total} 个无色盒子，先存入 E`);
+            if (washStationUndyedPos) {
+                const chest = bot.blockAt(washStationUndyedPos);
+                if (chest && isContainerBlock(chest.name)) {
+                    try {
+                        const cw = await bot.openChest(chest);
+                        undyedItems = bot.inventory.items().filter(i => isUndyedShulkerBox(i.name));
+                        let depCount = 0;
+                        for (const item of undyedItems) {
+                            try { await cw.deposit(item.type, item.metadata, item.count); depCount += item.count; } catch (e) { /* ignore */ }
+                        }
+                        await cw.close();
+                        if (depCount > 0) logParts.push(`存入 ${depCount} 个无色盒子`);
+                    } catch (err) {
+                        console.log(`${PREFIX} [洗盒-预检] 开E容器失败: ${err.message}`);
+                    }
+                } else {
+                    console.log(`${PREFIX} [洗盒-预检] E容器坐标方块不是容器，跳过存盒`);
+                }
+            }
+        }
+
+        // Step 2: 检查背包是否有空桶 → 去A装水
+        const emptyBuckets = bot.inventory.items().filter(i => isEmptyBucket(i.name));
+        if (emptyBuckets.length > 0 && washStationWaterPos) {
+            console.log(`${PREFIX} [洗盒-预检] 背包有 ${emptyBuckets.length} 个空桶，去水源装水`);
+            if (await ensureNearPos(washStationWaterPos, '水源A')) {
+                let filled = 0;
+                for (const bucket of emptyBuckets) {
+                    try {
+                        await bot.equip(bucket, 'hand');
+                        await sleep(200);
+                        const ok = await interactWaterSource();
+                        if (ok) filled++;
+                    } catch (err) {
+                        console.log(`${PREFIX} [洗盒-预检] 装水失败: ${err.message}`);
+                    }
+                }
+                if (filled > 0) {
+                    console.log(`${PREFIX} [洗盒-预检] 成功装水 ${filled}/${emptyBuckets.length} 个桶`);
+                } else {
+                    console.log(`${PREFIX} [洗盒-预检] 装水全部失败，请检查水源坐标 (${washStationWaterPos.x}, ${washStationWaterPos.y}, ${washStationWaterPos.z}) 是否为可装水的方块`);
+                }
+            }
+        }
+
+        // Step 3: 验证水源（如果配置了 -water）— 检查并搜索附近备选
+        if (washStationWaterPos) {
+            const waterBlock = bot.blockAt(washStationWaterPos);
+            if (!waterBlock) {
+                console.log(`${PREFIX} [洗盒-预检] 水源坐标 (${washStationWaterPos.x}, ${washStationWaterPos.y}, ${washStationWaterPos.z}) 处无方块（区块未加载?）`);
+            } else {
+                const props = JSON.stringify(waterBlock.properties || {});
+                const isWater = isWaterSourceBlock(waterBlock);
+                console.log(`${PREFIX} [洗盒-预检] 水源方块: ${waterBlock.name} properties=${props} isWaterSource=${isWater}`);
+                if (!isWater) {
+                    const nearby = findNearbyWater(washStationWaterPos, 5);
+                    if (nearby) {
+                        console.log(`${PREFIX} [洗盒-预检] ⚠ 指定坐标不是水源，但在附近 (${nearby.position.x}, ${nearby.position.y}, ${nearby.position.z}) 找到: ${nearby.name} — 运行时会自动使用`);
+                        logParts.push(`水源: ${waterBlock.name} ✗ → 自动用附近 ${nearby.name} @ (${nearby.position.x},${nearby.position.y},${nearby.position.z})`);
+                    } else {
+                        console.log(`${PREFIX} [洗盒-预检] ⚠ 指定坐标不是水源，且半径5格内无可用水源！请用 -water 重新指定`);
+                        logParts.push(`水源: ${waterBlock.name} ✗ (附近5格无水!)`);
+                    }
+                } else {
+                    logParts.push(`水源: ${waterBlock.name} ✓`);
+                }
+            }
+        } else {
+            console.log(`${PREFIX} [洗盒-预检] 未配置水源(-water)，将只能用水桶补水`);
+        }
+
+        // 验证C容器（如果配置了 -bucket）
+        if (washStationBucketPos) {
+            const bucketChest = bot.blockAt(washStationBucketPos);
+            if (!bucketChest) {
+                console.log(`${PREFIX} [洗盒-预检] C容器坐标 (${washStationBucketPos.x}, ${washStationBucketPos.y}, ${washStationBucketPos.z}) 处无方块！`);
+            } else if (!isContainerBlock(bucketChest.name)) {
+                console.log(`${PREFIX} [洗盒-预检] C容器坐标处不是容器！当前方块: ${bucketChest.name}`);
+            } else {
+                logParts.push(`C容器有效: ${bucketChest.name}`);
+            }
+        }
+
+        // Step 4: 检查炼药锅水位，装满
+        if (washStationCauldronPos) {
+            const cauldronBlock = bot.blockAt(washStationCauldronPos);
+            console.log(`${PREFIX} [洗盒-预检] 炼药锅坐标方块: ${cauldronBlock ? cauldronBlock.name + ' properties=' + JSON.stringify(cauldronBlock.properties || {}) + ' metadata=' + cauldronBlock.metadata : 'null(区块未加载?)'}`);
+            getCauldronWaterLevel(washStationCauldronPos, true); // 诊断输出
+            const level = getCauldronWaterLevel(washStationCauldronPos);
+            if (level >= 0 && level < 3) {
+                console.log(`${PREFIX} [洗盒-预检] 炼药锅水位 ${level}/3，补满`);
+                await fillCauldronToFull();
+                const newLevel = getCauldronWaterLevel(washStationCauldronPos);
+                washStationCauldronLevel = Math.max(0, newLevel);
+                if (washStationCauldronLevel >= 3) logParts.push(`炼药锅已补满 (${washStationCauldronLevel}/3)`);
+            } else if (level >= 3) {
+                washStationCauldronLevel = level;
+                logParts.push(`炼药锅已满 (${level}/3)`);
+            } else {
+                console.log(`${PREFIX} [洗盒-预检] 炼药锅状态异常 level=${level}，请检查坐标是否正确`);
+            }
+        }
+
+        // Step 5: 检查背包是否有染色盒子（上次中断残留） → 直接洗完
+        let dyedItems = bot.inventory.items().filter(i => isDyedShulkerBox(i.name));
+        if (dyedItems.length > 0) {
+            const total = dyedItems.reduce((s, i) => s + i.count, 0);
+            console.log(`${PREFIX} [洗盒-预检] 背包有 ${total} 个染色盒子（中断残留），先洗完`);
+            if (washStationCauldronPos && washStationCauldronLevel > 0) {
+                await ensureNearPos(washStationCauldronPos, '炼药锅B');
+                let washedCount = 0;
+                // 逐个洗涤，每洗完一个重新扫描（染色→无色改变物品）
+                while (washStationActive) {
+                    dyedItems = bot.inventory.items().filter(i => isDyedShulkerBox(i.name));
+                    if (dyedItems.length === 0) break;
+                    try {
+                        await washOneBox(dyedItems[0]);
+                        washedCount++;
+                    } catch (err) {
+                        console.log(`${PREFIX} [洗盒-预检] 洗盒失败: ${err.message}`);
+                        break;
+                    }
+                    await sleep(200);
+                }
+                if (washedCount > 0) logParts.push(`预洗 ${washedCount} 个染色盒子`);
+            } else if (washStationCauldronLevel <= 0) {
+                console.log(`${PREFIX} [洗盒-预检] 炼药锅无水，跳过预洗残留染色盒`);
+            }
+            // 把洗完的存入 E
+            undyedItems = bot.inventory.items().filter(i => isUndyedShulkerBox(i.name));
+            if (undyedItems.length > 0 && washStationUndyedPos) {
+                const chest = bot.blockAt(washStationUndyedPos);
+                if (chest && isContainerBlock(chest.name)) {
+                    try {
+                        const cw = await bot.openChest(chest);
+                        let depCount = 0;
+                        for (const item of undyedItems) {
+                            try { await cw.deposit(item.type, item.metadata, item.count); depCount += item.count; } catch (e) { /* ignore */ }
+                        }
+                        await cw.close();
+                        if (depCount > 0) logParts.push(`预洗后存入 ${depCount} 个无色盒子`);
+                    } catch (err) {
+                        console.log(`${PREFIX} [洗盒-预检] 存盒失败: ${err.message}`);
+                    }
+                }
+            }
+        }
+
+        if (logParts.length > 0 && washStationSender) {
+            safeWhisper(washStationSender, `[洗盒-预检] ${logParts.join('，')}`);
+        }
+        if (logParts.length > 0) {
+            console.log(`${PREFIX} [洗盒-预检] ${logParts.join('，')}`);
+        }
+    }
+
+    /** 将炼药锅装满水（从水源取水），返回 true=成功装满 */
+    async function fillCauldronToFull() {
+        if (!washStationActive) return false;
+        let level = getCauldronWaterLevel(washStationCauldronPos);
+        if (level < 0 || level === -2) {
+            console.log(`${PREFIX} [洗盒] 炼药锅状态异常 (level=${level})，无法装水`);
+            return false;
+        }
+        const needed = 3 - level;
+        if (needed <= 0) return true; // 已满
+
+        // 确保靠近炼药锅
+        if (!(await ensureNearPos(washStationCauldronPos, '炼药锅B'))) return false;
+
+        // 收集背包中的水桶
+        let waterBuckets = bot.inventory.items().filter(i => isWaterBucket(i.name));
+        let fills = 0;
+
+        for (const bucket of waterBuckets) {
+            if (!washStationActive) break;
+            if (fills >= needed) break;
+            try {
+                await bot.equip(bucket, 'hand');
+                await sleep(200);
+                await interactCauldron();
+                fills++;
+            } catch (err) {
+                console.log(`${PREFIX} [洗盒] 装水失败: ${err.message}`);
+                break;
+            }
+        }
+
+        if (fills > 0) {
+            console.log(`${PREFIX} [洗盒] 炼药锅加水 ${fills} 次`);
+            washStationCauldronLevel = Math.min(3, level + fills);
+        }
+
+        // 如果还需要更多水 → 去水源取水
+        if (fills < needed) {
+            const remaining = needed - fills;
+            console.log(`${PREFIX} [洗盒] 还需要 ${remaining} 次加水，去水源取水`);
+            if (await fetchAndFillWater(remaining)) {
+                washStationCauldronLevel = 3;
+                return true;
+            }
+        }
+
+        // 最终验证水位
+        const finalLevel = getCauldronWaterLevel(washStationCauldronPos);
+        washStationCauldronLevel = Math.max(0, finalLevel);
+        return washStationCauldronLevel >= 3;
+    }
+
+    /** 去水源A取水并返回炼药锅加水，最多 fillCount 次 */
+    async function fetchAndFillWater(fillCount) {
+        if (!washStationActive) return false;
+        let fills = 0;
+
+        // 先检查背包是否有水桶/空桶；没有则去C拿
+        let waterBuckets = bot.inventory.items().filter(i => isWaterBucket(i.name));
+        let emptyBuckets = bot.inventory.items().filter(i => isEmptyBucket(i.name));
+
+        // 如果既没水桶也没空桶，去 C 容器拿
+        if (waterBuckets.length === 0 && emptyBuckets.length === 0) {
+            if (!washStationBucketPos) {
+                console.log(`${PREFIX} [洗盒] 背包无桶且未配置C容器(-bucket)，无法补水！`);
+                return false;
+            }
+            console.log(`${PREFIX} [洗盒] 背包无桶，去C容器取水桶 @ (${washStationBucketPos.x}, ${washStationBucketPos.y}, ${washStationBucketPos.z})`);
+            if (!(await ensureNearPos(washStationBucketPos, 'C容器'))) {
+                console.log(`${PREFIX} [洗盒] 无法到达C容器`);
+                return false;
+            }
+            const chest = bot.blockAt(washStationBucketPos);
+            if (!chest || !isContainerBlock(chest.name)) {
+                console.log(`${PREFIX} [洗盒] C容器坐标处不是容器，当前方块: ${chest ? chest.name : 'null'}`);
+                return false;
+            }
+            try {
+                const cw = await bot.openChest(chest);
+                const allBuckets = (cw.inventoryStart !== undefined ? cw : (cw.window || cw));
+                const slots = allBuckets.slots ?? [];
+                const end = allBuckets.inventoryStart ?? slots.length;
+                let tookWater = 0, tookEmpty = 0;
+                for (let s = 0; s < end; s++) {
+                    const item = slots[s];
+                    if (!item) continue;
+                    if (isWaterBucket(item.name)) {
+                        try { await cw.withdraw(item.type, item.metadata, item.count); tookWater += item.count; } catch (e) { /* ignore */ }
+                    } else if (isEmptyBucket(item.name)) {
+                        try { await cw.withdraw(item.type, item.metadata, item.count); tookEmpty += item.count; } catch (e) { /* ignore */ }
+                    }
+                }
+                await cw.close();
+                waterBuckets = bot.inventory.items().filter(i => isWaterBucket(i.name));
+                emptyBuckets = bot.inventory.items().filter(i => isEmptyBucket(i.name));
+                console.log(`${PREFIX} [洗盒] 从C取出: 水桶 x${tookWater} 空桶 x${tookEmpty}（背包现有: 水桶 ${waterBuckets.length} 空桶 ${emptyBuckets.length}）`);
+            } catch (err) {
+                console.log(`${PREFIX} [洗盒] 开C容器失败: ${err.message}`);
+                return false;
+            }
+        }
+
+        if (waterBuckets.length === 0 && emptyBuckets.length === 0) {
+            console.log(`${PREFIX} [洗盒] C容器中无桶，无法补水！请在C中放入水桶或空桶`);
+            return false;
+        }
+
+        // 先用水桶直接装炼药锅
+        for (const bucket of waterBuckets) {
+            if (!washStationActive) return false;
+            if (fills >= fillCount) break;
+            if (getCauldronWaterLevel(washStationCauldronPos) >= 3) break;
+            try {
+                if (!(await ensureNearPos(washStationCauldronPos, '炼药锅B'))) break;
+                await bot.equip(bucket, 'hand');
+                await sleep(200);
+                await interactCauldron();
+                fills++;
+                console.log(`${PREFIX} [洗盒] 用水桶加水 (${fills}/${fillCount})`);
+            } catch (err) {
+                console.log(`${PREFIX} [洗盒] 水桶加水失败: ${err.message}`);
+                break;
+            }
+        }
+        let level = getCauldronWaterLevel(washStationCauldronPos);
+        washStationCauldronLevel = Math.max(0, level);
+        if (washStationCauldronLevel >= 3) {
+            console.log(`${PREFIX} [洗盒] 炼药锅已满 (${washStationCauldronLevel}/3)`);
+            return true;
+        }
+
+        // 仍有需要 → 去水源取水
+        emptyBuckets = bot.inventory.items().filter(i => isEmptyBucket(i.name));
+        if (emptyBuckets.length === 0) {
+            if (fills > 0) {
+                console.log(`${PREFIX} [洗盒] 背包无空桶可去水源取水（已用水桶加 ${fills} 次），炼药锅水位 ${washStationCauldronLevel}/3`);
+            } else {
+                console.log(`${PREFIX} [洗盒] 背包无空桶且无水桶，无法补水！`);
+            }
+            return fills > 0;
+        }
+
+        if (!washStationWaterPos) {
+            console.log(`${PREFIX} [洗盒] 未配置水源坐标(-water)，无法装水！`);
+            return fills > 0;
+        }
+
+        console.log(`${PREFIX} [洗盒] 带 ${emptyBuckets.length} 个空桶去水源装水`);
+        for (const bucket of emptyBuckets) {
+            if (!washStationActive) return false;
+            if (fills >= fillCount) break;
+            if (getCauldronWaterLevel(washStationCauldronPos) >= 3) break;
+
+            // 走到水源A → 装水 → 验证 → 走回炼药锅B → 加水
+            if (!(await ensureNearPos(washStationWaterPos, '水源A'))) {
+                console.log(`${PREFIX} [洗盒] 无法到达水源A，停止取水`);
+                break;
+            }
+            try {
+                await bot.equip(bucket, 'hand');
+                await sleep(200);
+                console.log(`${PREFIX} [洗盒] 在水源A装水...`);
+                const fillOk = await interactWaterSource();
+                if (!fillOk) {
+                    console.log(`${PREFIX} [洗盒] 水源装水失败，跳过此桶`);
+                    continue; // 尝试下一个空桶
+                }
+                await sleep(200);
+                // 走回炼药锅B
+                if (!(await ensureNearPos(washStationCauldronPos, '炼药锅B'))) {
+                    console.log(`${PREFIX} [洗盒] 无法到达炼药锅B，停止加水`);
+                    break;
+                }
+                // 再次确认手持的是水桶
+                const heldBeforeCauldron = bot.heldItem;
+                if (!heldBeforeCauldron || !isWaterBucket(heldBeforeCauldron.name)) {
+                    console.log(`${PREFIX} [洗盒] 到达炼药锅时手上不是水桶 (${heldBeforeCauldron ? heldBeforeCauldron.name : '空手'})，跳过`);
+                    continue;
+                }
+                console.log(`${PREFIX} [洗盒] 对炼药锅加水...`);
+                await interactCauldron();
+                fills++;
+                level = getCauldronWaterLevel(washStationCauldronPos);
+                washStationCauldronLevel = Math.max(0, level);
+                console.log(`${PREFIX} [洗盒] 取水+加水完成 (${fills}/${fillCount})，炼药锅水位 ${washStationCauldronLevel}/3`);
+                if (washStationCauldronLevel >= 3) break;
+            } catch (err) {
+                console.log(`${PREFIX} [洗盒] 取水循环失败: ${err.message}`);
+                break;
+            }
+        }
+
+        return fills > 0;
+    }
+
+    /** 洗一个染色盒子（假设已手持染色盒子，靠近炼药锅） */
+    async function washOneBox(item) {
+        if (!washStationCauldronPos) throw new Error('炼药锅坐标未配置');
+        // 炼药锅必须有水
+        if (!(await ensureCauldronHasWater())) {
+            throw new Error('炼药锅无水且补水失败');
+        }
+        // 确保手持染色盒子
+        await bot.equip(item, 'hand');
+        await sleep(200);
+        // 执行洗涤
+        await interactCauldron();
+        // 更新水位
+        const newLevel = getCauldronWaterLevel(washStationCauldronPos);
+        washStationCauldronLevel = Math.max(0, newLevel);
+        washStationTotalWashed++;
+    }
+
+    /** 确保炼药锅有水（无水则补充），返回 true=有水可用 */
+    async function ensureCauldronHasWater() {
+        const level = getCauldronWaterLevel(washStationCauldronPos);
+        washStationCauldronLevel = Math.max(0, level);
+        if (washStationCauldronLevel <= 0) {
+            console.log(`${PREFIX} [洗盒] 炼药锅无水，尝试补充...`);
+            const ok = await fillCauldronToFull();
+            if (!ok) {
+                console.log(`${PREFIX} [洗盒] 炼药锅补水失败！检查水源(-water)和桶容器(-bucket)配置`);
+                return false;
+            }
+            const newLevel = getCauldronWaterLevel(washStationCauldronPos);
+            washStationCauldronLevel = Math.max(0, newLevel);
+            if (washStationCauldronLevel <= 0) {
+                console.log(`${PREFIX} [洗盒] 炼药锅补水后仍无水，请检查坐标是否正确`);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 将背包中所有无色盒子存入 E 容器 */
+    async function depositAllUndyed() {
+        if (!washStationUndyedPos) return 0;
+        const undyedItems = bot.inventory.items().filter(i => isUndyedShulkerBox(i.name));
+        if (undyedItems.length === 0) return 0;
+
+        if (!(await ensureNearPos(washStationUndyedPos, 'E容器'))) return 0;
+
+        let totalDeposited = 0;
+        const chest = bot.blockAt(washStationUndyedPos);
+        if (!chest || !isContainerBlock(chest.name)) {
+            console.log(`${PREFIX} [洗盒] E容器不存在或不是容器`);
+            return 0;
+        }
+
+        try {
+            const cw = await bot.openChest(chest);
+            const toDeposit = bot.inventory.items().filter(i => isUndyedShulkerBox(i.name));
+            for (const item of toDeposit) {
+                try {
+                    await cw.deposit(item.type, item.metadata, item.count);
+                    totalDeposited += item.count;
+                } catch (e) { /* 盒子满 */ }
+            }
+            await cw.close();
+            if (totalDeposited > 0) {
+                console.log(`${PREFIX} [洗盒] 存入 ${totalDeposited} 个无色盒子到E`);
+            }
+        } catch (err) {
+            console.log(`${PREFIX} [洗盒] 开E容器失败: ${err.message}`);
+        }
+        return totalDeposited;
+    }
+
+    // ---- 洗盒主状态机 ----
+
+    function cleanupWashStation(reportMsg) {
+        washStationActive = false;
+        washStationState = 'IDLE';
+        washStationSubState = '';
+        if (washStationLoopTimer) { clearTimeout(washStationLoopTimer); washStationLoopTimer = null; }
+        const durSec = washStationStartTime > 0 ? Math.round((Date.now() - washStationStartTime) / 1000) : 0;
+        const durStr = durSec >= 3600 ? `${Math.floor(durSec / 3600)}h${Math.floor((durSec % 3600) / 60)}m`
+            : durSec >= 60 ? `${Math.floor(durSec / 60)}m${durSec % 60}s` : `${durSec}s`;
+        if (reportMsg && washStationSender) {
+            const summary = `${reportMsg} | 洗涤 ${washStationTotalWashed} 个盒子 | ${washStationCycleCount} 循环 | 运行 ${durStr}`;
+            safeWhisper(washStationSender, summary);
+        }
+        if (!bot.activateItemInterval && bot._startTime) {
+            bot.activateItemInterval = setInterval(() => bot.activateItem(), 50);
+        }
+    }
+
+    function failWashStation(msg) {
+        console.error(`${PREFIX} ${msg}`);
+        cleanupWashStation(msg);
+    }
+
+    function washScheduleTick(delay) {
+        if (!washStationActive) return;
+        if (washStationLoopTimer) clearTimeout(washStationLoopTimer);
+        washStationLoopTimer = setTimeout(() => { washStationLoopTimer = null; executeWashState(); }, delay);
+    }
+
+    function executeWashState() {
+        if (!washStationActive) return;
+        switch (washStationState) {
+            case 'PREFLIGHT':      phaseWashPreflight(); break;
+            case 'CAULDRON_CHECK': phaseWashCauldronCheck(); break;
+            case 'WITHDRAW':       phaseWashWithdraw(); break;
+            case 'WASH':           phaseWashBoxes(); break;
+            case 'DEPOSIT':        phaseWashDeposit(); break;
+            case 'TRANSFER_UNDYED':phaseWashTransferUndyed(); break;
+            case 'CHECK':          phaseWashCheck(); break;
+            case 'STOPPING':       cleanupWashStation('[洗盒] 已完成'); break;
+            default:               failWashStation('[洗盒] 未知状态，已停止');
+        }
+    }
+
+    // ---- PREFLIGHT 阶段 ----
+
+    async function phaseWashPreflight() {
+        try {
+            await runWashPreflight();
+        } catch (err) {
+            console.error(`${PREFIX} [洗盒-预检] 异常:`, err.message);
+        }
+        washStationState = 'CAULDRON_CHECK';
+        washScheduleTick(300);
+    }
+
+    // ---- CAULDRON_CHECK 阶段 ----
+
+    async function phaseWashCauldronCheck() {
+        if (!washStationCauldronPos) {
+            failWashStation('[洗盒] 炼药锅坐标B未配置');
+            return;
+        }
+        // 确保靠近炼药锅
+        if (!(await ensureNearPos(washStationCauldronPos, '炼药锅B'))) {
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation('[洗盒] 无法到达炼药锅B'); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] 无法到达炼药锅B (重试 ${washStationRetries}/10)`);
+            }
+            washScheduleTick(3000);
+            return;
+        }
+        washStationRetries = 0;
+
+        // 检查并确保炼药锅有水
+        if (!(await ensureCauldronHasWater())) {
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation('[洗盒] 炼药锅补水失败，已重试10次'); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] 炼药锅补水失败 (重试 ${washStationRetries}/10)`);
+            }
+            washScheduleTick(3000);
+            return;
+        }
+        washStationRetries = 0;
+        washStationState = 'WITHDRAW';
+        washScheduleTick(200);
+    }
+
+    // ---- WITHDRAW 阶段 ----
+
+    async function phaseWashWithdraw() {
+        if (!washStationDyedPos) {
+            failWashStation('[洗盒] 染色盒子容器坐标D未配置');
+            return;
+        }
+
+        // 确保靠近 D
+        if (!(await ensureNearPos(washStationDyedPos, 'D容器'))) {
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation('[洗盒] 无法到达D容器'); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] 无法到达D容器 (重试 ${washStationRetries}/10)`);
+            }
+            washScheduleTick(3000);
+            return;
+        }
+        washStationRetries = 0;
+
+        const chest = bot.blockAt(washStationDyedPos);
+        if (!chest || !isContainerBlock(chest.name)) {
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation('[洗盒] D容器不存在，染色盒耗尽'); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] D容器不存在 @ (${washStationDyedPos.x}, ${washStationDyedPos.y}, ${washStationDyedPos.z}) (重试 ${washStationRetries}/10)`);
+            }
+            washScheduleTick(3000);
+            return;
+        }
+
+        try {
+            const cw = await bot.openChest(chest);
+            let totalDyed = 0;
+
+            // 先收集染色盒子
+            const win = (cw.inventoryStart !== undefined) ? cw : (cw.window || cw);
+            const end = win.inventoryStart ?? win.slots?.length ?? 0;
+            const slots = win.slots ?? [];
+            for (let s = 0; s < end; s++) {
+                const item = slots[s];
+                if (item && isDyedShulkerBox(item.name)) {
+                    try {
+                        await cw.withdraw(item.type, item.metadata, item.count);
+                        totalDyed += item.count;
+                    } catch (e) { /* ignore */ }
+                }
+            }
+
+            await cw.close();
+
+            if (totalDyed === 0) {
+                // 没有染色盒子了 → 检查是否需要转移无色盒子
+                washStationState = 'TRANSFER_UNDYED';
+                washScheduleTick(200);
+                return;
+            }
+
+            washStationRetries = 0;
+            if (washStationLogCycleCounter % 20 === 0) {
+                console.log(`${PREFIX} [洗盒] 取出 ${totalDyed} 个染色盒子`);
+            }
+            washStationState = 'WASH';
+            washScheduleTick(300);
+        } catch (err) {
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation(`[洗盒] 开D容器失败: ${err.message}`); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] 开D容器失败 (重试 ${washStationRetries}/10): ${err.message}`);
+            }
+            washScheduleTick(3000);
+        }
+    }
+
+    // ---- WASH 阶段 ----
+
+    async function phaseWashBoxes() {
+        // 每轮重新扫描背包，因为洗涤会改变物品（染色→无色）
+        let dyedItems = bot.inventory.items().filter(i => isDyedShulkerBox(i.name));
+        if (dyedItems.length === 0) {
+            washStationState = 'DEPOSIT';
+            washScheduleTick(200);
+            return;
+        }
+
+        // 确保靠近炼药锅
+        if (!(await ensureNearPos(washStationCauldronPos, '炼药锅B'))) {
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation('[洗盒] 无法到达炼药锅B进行洗涤'); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] 无法到达炼药锅B (重试 ${washStationRetries}/10)`);
+            }
+            washScheduleTick(3000);
+            return;
+        }
+        washStationRetries = 0;
+
+        let washedCount = 0;
+
+        // 逐个洗涤，每洗完一个重新扫描物品栏（因为染色盒子变成了无色盒子）
+        while (washStationActive) {
+            dyedItems = bot.inventory.items().filter(i => isDyedShulkerBox(i.name));
+            if (dyedItems.length === 0) break;
+
+            const item = dyedItems[0];
+
+            // 洗涤前确保炼药锅有水
+            if (!(await ensureCauldronHasWater())) {
+                console.log(`${PREFIX} [洗盒] 炼药锅补水失败，稍后重试`);
+                washScheduleTick(3000);
+                return;
+            }
+
+            try {
+                await washOneBox(item);
+                washedCount++;
+            } catch (err) {
+                console.error(`${PREFIX} [洗盒] 洗涤失败: ${err.message}`);
+                // 单个盒子失败不中断，继续下一个
+            }
+
+            // 小延时避免过快发包 + 等待物品栏同步
+            await sleep(200);
+        }
+
+        if (washedCount > 0 && washStationLogCycleCounter % 5 === 0) {
+            console.log(`${PREFIX} [洗盒] 本轮洗涤 ${washedCount} 个盒子`);
+        }
+
+        // 洗完后进入存物阶段
+        washStationState = 'DEPOSIT';
+        washScheduleTick(300);
+    }
+
+    // ---- DEPOSIT 阶段 ----
+
+    async function phaseWashDeposit() {
+        const deposited = await depositAllUndyed();
+
+        // 检查是否还有残留的无色盒子
+        const stillRemaining = bot.inventory.items().filter(i => isUndyedShulkerBox(i.name));
+        if (stillRemaining.length > 0 && deposited === 0) {
+            // 一点都没存进去 → E 可能满了
+            washStationRetries++;
+            if (washStationRetries > 10) { failWashStation('[洗盒] E容器持续无法存入，可能已满'); return; }
+            if (shouldLogRetry(washStationRetries)) {
+                console.log(`${PREFIX} [洗盒] E容器无法存入，背包有 ${stillRemaining.reduce((s, i) => s + i.count, 0)} 个无色盒子 (重试 ${washStationRetries}/10)`);
+            }
+            washScheduleTick(3000);
+            return;
+        }
+        washStationRetries = 0;
+
+        // 检查背包是否还有染色盒子（WASH阶段可能因炼药锅缺水中断）
+        const dyedItems = bot.inventory.items().filter(i => isDyedShulkerBox(i.name));
+        if (dyedItems.length > 0) {
+            // 还有染色盒子没洗完 → 回到WASH
+            washStationState = 'CAULDRON_CHECK';
+            washScheduleTick(200);
+            return;
+        }
+
+        washStationState = 'TRANSFER_UNDYED';
+        washScheduleTick(200);
+    }
+
+    // ---- TRANSFER_UNDYED 阶段：将D中的无色盒子转移到E ----
+
+    async function phaseWashTransferUndyed() {
+        if (!washStationDyedPos || !washStationUndyedPos) {
+            washStationState = 'CHECK';
+            washScheduleTick(200);
+            return;
+        }
+
+        if (!(await ensureNearPos(washStationDyedPos, 'D容器'))) {
+            // 无法到达就跳过转移
+            washStationState = 'CHECK';
+            washScheduleTick(200);
+            return;
+        }
+
+        const chest = bot.blockAt(washStationDyedPos);
+        if (!chest || !isContainerBlock(chest.name)) {
+            washStationState = 'CHECK';
+            washScheduleTick(200);
+            return;
+        }
+
+        try {
+            const cw = await bot.openChest(chest);
+            const win = (cw.inventoryStart !== undefined) ? cw : (cw.window || cw);
+            const end = win.inventoryStart ?? win.slots?.length ?? 0;
+            const slots = win.slots ?? [];
+
+            // 找无色盒子
+            let totalUndyed = 0;
+            for (let s = 0; s < end; s++) {
+                const item = slots[s];
+                if (item && isUndyedShulkerBox(item.name)) {
+                    try {
+                        await cw.withdraw(item.type, item.metadata, item.count);
+                        totalUndyed += item.count;
+                    } catch (e) { /* ignore */ }
+                }
+            }
+            await cw.close();
+
+            if (totalUndyed > 0) {
+                console.log(`${PREFIX} [洗盒] 从D转移 ${totalUndyed} 个无色盒子到E`);
+                // 确保靠近E再存
+                const deposited = await depositAllUndyed();
+                if (deposited === 0) {
+                    console.log(`${PREFIX} [洗盒] 转移的无色盒子无法存入E，E可能已满`);
+                }
+            } else {
+                // D 中既无染色盒也无无色盒 → 源头耗尽
+                washStationSourceDepleted = true;
+                console.log(`${PREFIX} [洗盒] D容器已无盒子（染色+无色均空），源头耗尽`);
+            }
+        } catch (err) {
+            console.log(`${PREFIX} [洗盒] 转移无色盒子失败: ${err.message}`);
+        }
+
+        washStationState = 'CHECK';
+        washScheduleTick(200);
+    }
+
+    // ---- CHECK 阶段 ----
+
+    function phaseWashCheck() {
+        washStationCycleCount++;
+        washStationLogCycleCounter++;
+
+        // 每 20 循环输出汇总
+        if (washStationLogCycleCounter % 20 === 0) {
+            const durSec = washStationStartTime > 0 ? Math.round((Date.now() - washStationStartTime) / 1000) : 0;
+            const durStr = durSec >= 3600 ? `${Math.floor(durSec / 3600)}h${Math.floor((durSec % 3600) / 60)}m`
+                : durSec >= 60 ? `${Math.floor(durSec / 60)}m${durSec % 60}s` : `${durSec}s`;
+            console.log(`${PREFIX} [洗盒] 第 ${washStationCycleCount} 循环 | 累计洗涤 ${washStationTotalWashed} 个盒子 | 运行 ${durStr}`);
+        }
+
+        if (washStationPendingStop) {
+            cleanupWashStation('[洗盒] 已按请求停止');
+            return;
+        }
+        if (washStationCycles > 0 && washStationCycleCount >= washStationCycles) {
+            cleanupWashStation(`[洗盒] 已完成 ${washStationCycles} 次循环`);
+            return;
+        }
+        if (washStationSourceDepleted) {
+            cleanupWashStation('[洗盒] D容器已无盒子，自动停止');
+            return;
+        }
+
+        // 回到炼药锅检查 → 继续下一轮
+        washStationState = 'CAULDRON_CHECK';
+        washScheduleTick(500);
+    }
+
+    /** 启动洗潜影盒自动化 */
+    async function startWashStation(waterPos, cauldronPos, bucketPos, dyedPos, undyedPos, cycles, sender) {
+        if (!bot.entity) return '[洗盒] 机器人尚未完全加载';
+        // 如果已有运行中的洗盒站，先停掉
+        if (washStationActive) stopWashStation(true);
+
+        // 验证必要参数
+        if (!cauldronPos) return '[洗盒] 必须提供炼药锅坐标 (-cauldron x y z)';
+        if (!dyedPos) return '[洗盒] 必须提供染色盒子容器坐标 (-dyed x y z)';
+        if (!undyedPos) return '[洗盒] 必须提供无色盒子容器坐标 (-undyed x y z)';
+
+        washStationWaterPos = waterPos;
+        washStationCauldronPos = cauldronPos;
+        washStationBucketPos = bucketPos;
+        washStationDyedPos = dyedPos;
+        washStationUndyedPos = undyedPos;
+        washStationSender = sender;
+        washStationCycles = cycles || 0;
+        washStationActive = true;
+        washStationPendingStop = false;
+        washStationCycleCount = 0;
+        washStationTotalWashed = 0;
+        washStationRetries = 0;
+        washStationCauldronLevel = 0;
+        washStationStartTime = Date.now();
+        washStationLogCycleCounter = 0;
+        washStationSubState = '';
+        washStationSourceDepleted = false;
+
+        // 报告所有坐标
+        const fmtPos = (p) => p ? `(${p.x}, ${p.y}, ${p.z})` : '(未配置)';
+        console.log(`${PREFIX} [洗盒] ===== 坐标配置 =====`);
+        console.log(`${PREFIX} [洗盒]   水源   (-water)  : ${fmtPos(waterPos)}`);
+        console.log(`${PREFIX} [洗盒]   炼药锅 (-cauldron): ${fmtPos(cauldronPos)}`);
+        console.log(`${PREFIX} [洗盒]   桶容器 (-bucket)  : ${fmtPos(bucketPos)}`);
+        console.log(`${PREFIX} [洗盒]   染色盒 (-dyed)    : ${fmtPos(dyedPos)}`);
+        console.log(`${PREFIX} [洗盒]   无色盒 (-undyed)  : ${fmtPos(undyedPos)}`);
+        console.log(`${PREFIX} [洗盒]   循环次数: ${washStationCycles > 0 ? washStationCycles : '无限'}`);
+        console.log(`${PREFIX} [洗盒]   当前站位: (${Math.floor(bot.entity.position.x)}, ${Math.floor(bot.entity.position.y)}, ${Math.floor(bot.entity.position.z)})`);
+
+        // 停掉 anti-AFK 右键（避免干扰）
+        if (bot.activateItemInterval) {
+            clearInterval(bot.activateItemInterval);
+            bot.activateItemInterval = null;
+        }
+
+        // 进入预检阶段
+        washStationState = 'PREFLIGHT';
+        washScheduleTick(500);
+
+        return `[洗盒] 已启动${cycles > 0 ? ' (最大 ' + cycles + ' 循环)' : ' (无限循环)'}`;
+    }
+
+    function stopWashStation(immediate) {
+        if (!washStationActive) return '[洗盒] 当前未运行';
+        if (immediate) {
+            cleanupWashStation('[洗盒] 已强制停止');
+            if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow); } catch (e) { /* ignore */ } }
+            if (!bot.activateItemInterval && bot._startTime) {
+                bot.activateItemInterval = setInterval(() => bot.activateItem(), 50);
+            }
+            return '[洗盒] 已强制停止';
+        }
+        washStationPendingStop = true;
+        return '[洗盒] 将在当前循环结束后停止';
     }
 
     // ================================================================
@@ -4134,6 +5310,88 @@ bot.on('playerLeft', (player) => {
         }, true, {
             input: { type: 'string', description: '输入物品名称（如 gold_nugget）', required: true },
             output: { type: 'string', description: '输出物品名称（如 gold_ingot）', required: true },
+            cycles: { type: 'string', description: '循环次数或 infinite（可选，默认无限）', required: false },
+        });
+
+    // ---- 洗潜影盒命令 ----
+
+    cmd('/washbox', ['/washbox'],
+        TRIGGER.WHISPER | TRIGGER.WEB | TRIGGER.QQ_AT,
+        TARGET.TRUSTED,
+        '/washbox [-water x y z] [-cauldron x y z] [-bucket x y z] [-dyed x y z] [-undyed x y z] [循环次数|infinite] — 洗潜影盒自动化。子命令: stop | force | status',
+        async (ctx, args) => {
+            const trimmed = args.trim();
+
+            // 子命令
+            const firstWord = trimmed.split(/\s+/)[0];
+            if (firstWord === 'stop') { ctx.reply(stopWashStation(false)); return; }
+            if (firstWord === 'force') { ctx.reply(stopWashStation(true)); return; }
+            if (firstWord === 'status') {
+                if (washStationActive) {
+                    const lvl = washStationCauldronLevel;
+                    const durSec = washStationStartTime > 0 ? Math.round((Date.now() - washStationStartTime) / 1000) : 0;
+                    const durStr = durSec >= 3600 ? `${Math.floor(durSec / 3600)}h${Math.floor((durSec % 3600) / 60)}m`
+                        : durSec >= 60 ? `${Math.floor(durSec / 60)}m${durSec % 60}s` : `${durSec}s`;
+                    ctx.reply(`[洗盒] 运行中 | 状态: ${washStationState} | 第 ${washStationCycleCount} 循环 | 已洗 ${washStationTotalWashed} 个盒子 | 炼药锅水位 ${lvl}/3 | 运行 ${durStr}`);
+                } else {
+                    ctx.reply('[洗盒] 当前未运行');
+                }
+                return;
+            }
+
+            // 解析标志: -water x y z  -cauldron x y z  -bucket x y z  -dyed x y z  -undyed x y z
+            const waterMatch = trimmed.match(/-water\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)/);
+            const cauldronMatch = trimmed.match(/-cauldron\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)/);
+            const bucketMatch = trimmed.match(/-bucket\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)/);
+            const dyedMatch = trimmed.match(/-dyed\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)/);
+            const undyedMatch = trimmed.match(/-undyed\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)/);
+
+            let waterPos = null, cauldronPos = null, bucketPos = null, dyedPos = null, undyedPos = null;
+            if (waterMatch) waterPos = new Vec3(parseInt(waterMatch[1]), parseInt(waterMatch[2]), parseInt(waterMatch[3]));
+            if (cauldronMatch) cauldronPos = new Vec3(parseInt(cauldronMatch[1]), parseInt(cauldronMatch[2]), parseInt(cauldronMatch[3]));
+            if (bucketMatch) bucketPos = new Vec3(parseInt(bucketMatch[1]), parseInt(bucketMatch[2]), parseInt(bucketMatch[3]));
+            if (dyedMatch) dyedPos = new Vec3(parseInt(dyedMatch[1]), parseInt(dyedMatch[2]), parseInt(dyedMatch[3]));
+            if (undyedMatch) undyedPos = new Vec3(parseInt(undyedMatch[1]), parseInt(undyedMatch[2]), parseInt(undyedMatch[3]));
+
+            // 验证关键坐标
+            const missing = [];
+            if (!cauldronMatch) missing.push('-cauldron (炼药锅)');
+            if (!dyedMatch) missing.push('-dyed (染色盒容器)');
+            if (!undyedMatch) missing.push('-undyed (无色盒容器)');
+            if (missing.length > 0) {
+                ctx.reply(`[洗盒] 缺少必要坐标: ${missing.join(', ')}`);
+                ctx.reply('[洗盒] 用法: /washbox -cauldron <炼药锅 x y z> -dyed <染色容器 x y z> -undyed <无色容器 x y z> [-water <水源 x y z>] [-bucket <桶容器 x y z>] [循环次数]');
+                ctx.reply('[洗盒] 例如: /washbox -water 100 64 200 -cauldron 100 64 201 -bucket 100 64 202 -dyed 100 64 203 -undyed 100 64 204');
+                ctx.reply('[洗盒] 子命令: stop | force | status');
+                return;
+            }
+
+            // 去掉标志部分，剩下的就是 cycles
+            const remaining = trimmed
+                .replace(/-water\s+-?\d+\s+-?\d+\s+-?\d+/g, '')
+                .replace(/-cauldron\s+-?\d+\s+-?\d+\s+-?\d+/g, '')
+                .replace(/-bucket\s+-?\d+\s+-?\d+\s+-?\d+/g, '')
+                .replace(/-dyed\s+-?\d+\s+-?\d+\s+-?\d+/g, '')
+                .replace(/-undyed\s+-?\d+\s+-?\d+\s+-?\d+/g, '')
+                .trim();
+            let cycles = 0;
+            if (remaining) {
+                const third = remaining.split(/\s+/)[0].toLowerCase();
+                if (third === 'infinite' || third === 'inf' || third === '0') cycles = 0;
+                else {
+                    cycles = parseInt(third);
+                    if (isNaN(cycles) || cycles < 0) { ctx.reply('[洗盒] 循环次数必须为非负整数或 infinite'); return; }
+                }
+            }
+
+            const msg = await startWashStation(waterPos, cauldronPos, bucketPos, dyedPos, undyedPos, cycles, ctx.sender);
+            ctx.reply(msg);
+        }, true, {
+            water: { type: 'string', description: '水源坐标 -water x y z（可选）', required: false },
+            cauldron: { type: 'string', description: '炼药锅坐标 -cauldron x y z（必填）', required: true },
+            bucket: { type: 'string', description: '桶容器坐标 -bucket x y z（可选）', required: false },
+            dyed: { type: 'string', description: '染色盒子容器坐标 -dyed x y z（必填）', required: true },
+            undyed: { type: 'string', description: '无色盒子容器坐标 -undyed x y z（必填）', required: true },
             cycles: { type: 'string', description: '循环次数或 infinite（可选，默认无限）', required: false },
         });
 
