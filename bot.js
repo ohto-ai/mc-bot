@@ -4953,7 +4953,7 @@ bot.on('playerLeft', (player) => {
         return String(vd);
     }
 
-    // 尝试实时更新视图距离（发送 client_information 包通知服务器）
+    // 尝试实时更新视图距离（发送 settings 包通知服务器）
     function applyViewDistance(newVD) {
         const numeric = typeof newVD === 'string' ? (VIEW_DISTANCE_LEVELS[newVD.toLowerCase()] || parseInt(newVD)) : newVD;
         if (isNaN(numeric) || numeric < 2 || numeric > 32) return false;
@@ -4963,30 +4963,42 @@ bot.on('playerLeft', (player) => {
             bot.settings.viewDistance = numeric;
         }
 
-        // 向服务器发送更新后的客户端设置
+        // 向服务器发送更新后的客户端设置（使用 mineflayer 内置方法以确保正确的数据包格式和字段名）
         try {
-            // 获取当前语言环境（尽量保留原值）
-            const locale = bot.settings?.locale || 'zh_CN';
-            const chatMode = bot.settings?.chatMode ?? 0;
-            const chatColors = bot.settings?.chatColors ?? true;
-            const displayedSkinParts = bot.settings?.displayedSkinParts ?? 0xff;
-            const mainHand = bot.settings?.mainHand ?? 1;
-            const enableTextFiltering = bot.settings?.enableTextFiltering ?? false;
-            const allowServerListings = bot.settings?.allowServerListings ?? true;
+            if (typeof bot.setSettings === 'function') {
+                bot.setSettings({ viewDistance: numeric });
+            } else {
+                // 兜底：直接写入 settings 数据包（1.20.4 的正确数据包名为 settings 而非 client_information）
+                const locale = bot.settings?.locale || 'zh_CN';
+                const chatFlags = bot.settings?.chat === 'commandsOnly' ? 1 : (bot.settings?.chat === 'disabled' ? 2 : 0);
+                const chatColors = bot.settings?.colorsEnabled ?? true;
+                const skinParts = typeof bot.settings?.skinParts === 'object'
+                    ? ((bot.settings.skinParts.showCape ? 1 : 0) << 0 |
+                       (bot.settings.skinParts.showJacket ? 1 : 0) << 1 |
+                       (bot.settings.skinParts.showLeftSleeve ? 1 : 0) << 2 |
+                       (bot.settings.skinParts.showRightSleeve ? 1 : 0) << 3 |
+                       (bot.settings.skinParts.showLeftPants ? 1 : 0) << 4 |
+                       (bot.settings.skinParts.showRightPants ? 1 : 0) << 5 |
+                       (bot.settings.skinParts.showHat ? 1 : 0) << 6)
+                    : 0x7f;
+                const mainHand = bot.settings?.mainHand === 'left' ? 0 : 1;
+                const enableTextFiltering = bot.settings?.enableTextFiltering ?? false;
+                const enableServerListing = bot.settings?.enableServerListing ?? true;
 
-            bot._client.write('client_information', {
-                locale,
-                viewDistance: numeric,
-                chatMode,
-                chatColors,
-                displayedSkinParts,
-                mainHand,
-                enableTextFiltering,
-                allowServerListings,
-            });
+                bot._client.write('settings', {
+                    locale,
+                    viewDistance: numeric,
+                    chatFlags,
+                    chatColors,
+                    skinParts,
+                    mainHand,
+                    enableTextFiltering,
+                    enableServerListing,
+                });
+            }
             return true;
         } catch (err) {
-            console.error(`${PREFIX} [视图] 发送 client_information 失败:`, err.message);
+            console.error(`${PREFIX} [视图] 发送 settings 失败:`, err.message);
             return false;
         }
     }
