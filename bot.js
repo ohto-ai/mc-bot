@@ -1380,6 +1380,8 @@ function createBotInstance(config, options = {}) {
         }
         if (whisperMatch && !isSelfEcho) {
             const [_, sender, msg] = whisperMatch;
+            // 防止机器人响应自己的私聊（避免无限对话循环）
+            if (sender.trim().toLowerCase() === bot.username.toLowerCase()) return;
             console.log(`${PREFIX} [私聊-兜底] ${sender}: ${msg}`);
             const isTrusted = trustedPlayers.includes(sender.trim());
             const ctx = createMessageContext('whisper', TRIGGER.WHISPER, sender.trim(), msg.trim(), isTrusted);
@@ -5377,6 +5379,9 @@ bot.on('playerLeft', (player) => {
 
     // 公聊事件
     bot.on('chat', (username, message) => {
+        // 防止机器人响应自己的消息（避免无限对话循环）
+        if (username === bot.username) return;
+
         const isTrusted = trustedPlayers.includes(username);
 
         // 检测 @提及 / >> 回复
@@ -5402,6 +5407,9 @@ bot.on('playerLeft', (player) => {
 
     // 私聊事件
     bot.on('whisper', (username, message) => {
+        // 防止机器人响应自己的私聊（避免无限对话循环）
+        if (username === bot.username) return;
+
         console.log(`${PREFIX} [私聊] ${username}: ${message}`);
         const isTrusted = trustedPlayers.includes(username);
         const ctx = createMessageContext('whisper', TRIGGER.WHISPER, username, message, isTrusted);
