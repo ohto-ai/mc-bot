@@ -407,7 +407,7 @@ function createBotInstance(config, options = {}) {
     let craftStationRetries = 0;         // 当前阶段重试次数
     let craftStationPendingStop = false; // 优雅停止标志
     let craftStationLoopTimer = null;    // setTimeout 句柄
-    let craftStationLogCycleCounter = 0; // 日志节流：每 20 循环输出一次汇总
+    // 日志节流计数器已移除 —— 合成站只在开始/结束/出错时输出，避免内存持续增长
     let craftStationStartTime = 0;       // 合成站启动时刻 ms
     let craftStationSourcePos = null;    // 左侧箱子 Vec3（每轮更新）
     let craftStationDestPos = null;      // 右侧箱子 Vec3（每轮更新）
@@ -805,9 +805,7 @@ function createBotInstance(config, options = {}) {
         if (craftStationConfigPos && craftStationConfigPos.source) {
             const pos = craftStationConfigPos.source;
             const b = bot.blockAt(pos);
-            console.log(`${PREFIX} [合成站] 探测左侧指定坐标 (${pos.x}, ${pos.y}, ${pos.z}): ${b ? b.name : 'null(区块未加载?)'}`);
             if (b && isContainerBlock(b.name)) return b;
-            if (b) console.log(`${PREFIX} [合成站] 左侧坐标方块 '${b.name}' 不是容器（可能已被机器拆除）`);
             // 指定了坐标就不用 fallback，避免误触其他方块
             return null;
         }
@@ -821,7 +819,6 @@ function createBotInstance(config, options = {}) {
             matching: bl => bl && isShulkerBox(bl.name),
             maxDistance: 5,
         });
-        if (found) console.log(`${PREFIX} [合成站] 自动探测到左侧潜影盒: ${found.name} @ (${found.position.x}, ${found.position.y}, ${found.position.z})`);
         return found || null;
     }
 
@@ -831,9 +828,7 @@ function createBotInstance(config, options = {}) {
         if (craftStationConfigPos && craftStationConfigPos.dest) {
             const pos = craftStationConfigPos.dest;
             const b = bot.blockAt(pos);
-            console.log(`${PREFIX} [合成站] 探测右侧指定坐标 (${pos.x}, ${pos.y}, ${pos.z}): ${b ? b.name : 'null(区块未加载?)'}`);
             if (b && isContainerBlock(b.name)) return b;
-            if (b) console.log(`${PREFIX} [合成站] 右侧坐标方块 '${b.name}' 不是容器（可能已被机器拆除）`);
             // 指定了坐标就不用 fallback，避免误触其他方块
             return null;
         }
@@ -847,7 +842,6 @@ function createBotInstance(config, options = {}) {
             matching: bl => bl && isShulkerBox(bl.name),
             maxDistance: 5,
         });
-        if (found) console.log(`${PREFIX} [合成站] 自动探测到右侧潜影盒: ${found.name} @ (${found.position.x}, ${found.position.y}, ${found.position.z})`);
         return found || null;
     }
 
@@ -1044,7 +1038,6 @@ function createBotInstance(config, options = {}) {
 
         // 合成站运行中（预检、存取物等阶段），不触发菜单自动点击，避免干扰合成站操作
         if (craftStationActive) {
-            console.log(`${PREFIX} [菜单] 合成站运行中，跳过菜单自动点击`);
             return;
         }
 
@@ -2040,7 +2033,6 @@ bot.on('playerLeft', (player) => {
         let outputItems = bot.inventory.items().filter(i => i.name === outputName);
         if (outputItems.length > 0) {
             const totalOutput = outputItems.reduce((sum, i) => sum + i.count, 0);
-            console.log(`${PREFIX} [合成站-预检] 背包有 ${totalOutput} 个产物 ${outputName}，先存入产物盒`);
 
             const dest = findDestChest();
             if (dest) {
@@ -2053,10 +2045,8 @@ bot.on('playerLeft', (player) => {
                     await cw.close();
                     if (totalDeposited > 0) logParts.push(`存入 ${totalDeposited} 个产物`);
                 } catch (err) {
-                    console.log(`${PREFIX} [合成站-预检] 开产物盒失败: ${err.message}，跳过`);
+                    // 开产物盒失败，跳过
                 }
-            } else {
-                console.log(`${PREFIX} [合成站-预检] 未找到产物盒，跳过存物`);
             }
         }
 
@@ -2064,7 +2054,6 @@ bot.on('playerLeft', (player) => {
         let inputItems = bot.inventory.items().filter(i => i.name === inputName);
         if (inputItems.length >= 9) {
             const totalInput = inputItems.reduce((sum, i) => sum + i.count, 0);
-            console.log(`${PREFIX} [合成站-预检] 背包有 ${totalInput} 个原材料（${inputItems.length} 组），先合成`);
 
             const table = findCraftingTable();
             if (table) {
@@ -2082,7 +2071,6 @@ bot.on('playerLeft', (player) => {
 
                     if (!isCraftingTableWindow(window)) {
                         try { bot.closeWindow(window); } catch (e) { /* ignore */ }
-                        console.log(`${PREFIX} [合成站-预检] 意外窗口类型: ${window.type}，跳过合成`);
                     } else {
                         const GRID_START = 1;
                         const RESULT_SLOT = 0;
@@ -2118,10 +2106,8 @@ bot.on('playerLeft', (player) => {
                         }
                     }
                 } catch (err) {
-                    console.log(`${PREFIX} [合成站-预检] 合成失败: ${err.message}，跳过`);
+                    // 合成失败，跳过
                 }
-            } else {
-                console.log(`${PREFIX} [合成站-预检] 未找到工作台，跳过合成`);
             }
         }
 
@@ -2140,7 +2126,7 @@ bot.on('playerLeft', (player) => {
                         await cw.close();
                         if (depCount > 0) logParts.push(`再存入 ${depCount} 个产物`);
                     } catch (err) {
-                        console.log(`${PREFIX} [合成站-预检] 再存产物失败: ${err.message}`);
+                        // 再存产物失败
                     }
                 }
             }
@@ -2174,8 +2160,6 @@ bot.on('playerLeft', (player) => {
         craftStationRetries = 0;
         craftStationStartTime = Date.now();
         craftStationSourcePos = null;
-        craftStationDestPos = null;
-        craftStationLogCycleCounter = 0;
         // 停掉 anti-AFK 右键（避免干扰 GUI）
         if (bot.activateItemInterval) {
             clearInterval(bot.activateItemInterval);
@@ -2228,9 +2212,10 @@ bot.on('playerLeft', (player) => {
         const durSec = craftStationStartTime > 0 ? Math.round((Date.now() - craftStationStartTime) / 1000) : 0;
         const durStr = durSec >= 3600 ? `${Math.floor(durSec/3600)}h${Math.floor((durSec%3600)/60)}m`
             : durSec >= 60 ? `${Math.floor(durSec/60)}m${durSec%60}s` : `${durSec}s`;
-        if (reportMsg && craftStationSender) {
+        if (reportMsg) {
             const summary = `${reportMsg} | 合成 ${craftStationTotalCrafted} 个产物 | ${craftStationCycleCount} 循环 | 运行 ${durStr}`;
-            safeWhisper(craftStationSender, summary);
+            console.log(`${PREFIX} ${summary}`);
+            if (craftStationSender) safeWhisper(craftStationSender, summary);
         }
         if (!bot.activateItemInterval && bot._startTime) {
             bot.activateItemInterval = setInterval(() => bot.activateItem(), 50);
@@ -2284,9 +2269,6 @@ bot.on('playerLeft', (player) => {
                 failStation(`[合成站] 探测箱子超时: 左=${src ? 'OK' : '缺失'} 右=${dst ? 'OK' : '缺失'}，盒子耗尽`);
                 return;
             }
-            if (shouldLogRetry(craftStationRetries)) {
-                console.log(`${PREFIX} [合成站] 箱子未就绪 (重试 ${craftStationRetries}/10): 左=${src ? 'OK' : '缺失'} 右=${dst ? 'OK' : '缺失'}`);
-            }
             scheduleTick(3000);
             return;
         }
@@ -2308,9 +2290,6 @@ bot.on('playerLeft', (player) => {
             if (!chest || !isContainerBlock(chest.name)) {
                 craftStationRetries++;
                 if (craftStationRetries > 10) { failStation('[合成站] 左侧盒子缺失，原材料耗尽'); return; }
-                if (shouldLogRetry(craftStationRetries)) {
-                    console.log(`${PREFIX} [合成站] 左侧盒子不存在 @ (${craftStationSourcePos.x}, ${craftStationSourcePos.y}, ${craftStationSourcePos.z}) (重试 ${craftStationRetries}/10)`);
-                }
                 // 不清空坐标 —— 机器换盒后会放在同一位置
                 scheduleTick(3000);
                 return;
@@ -2320,9 +2299,6 @@ bot.on('playerLeft', (player) => {
             if (!chest) {
                 craftStationRetries++;
                 if (craftStationRetries > 10) { failStation('[合成站] 未找到左侧盒子，原材料耗尽'); return; }
-                if (shouldLogRetry(craftStationRetries)) {
-                    console.log(`${PREFIX} [合成站] 未找到左侧盒子 (重试 ${craftStationRetries}/10)`);
-                }
                 scheduleTick(3000);
                 return;
             }
@@ -2335,9 +2311,6 @@ bot.on('playerLeft', (player) => {
         if (!verifyBlock || !isContainerBlock(verifyBlock.name)) {
             craftStationRetries++;
             if (craftStationRetries > 10) { failStation('[合成站] 左侧盒子在打开前被移除，原材料耗尽'); return; }
-            if (shouldLogRetry(craftStationRetries)) {
-                console.log(`${PREFIX} [合成站] 左侧盒子在打开前消失 (重试 ${craftStationRetries}/10)`);
-            }
             scheduleTick(1500);
             return;
         }
@@ -2362,25 +2335,15 @@ bot.on('playerLeft', (player) => {
             if (totalWithdrawn === 0) {
                 craftStationRetries++;
                 if (craftStationRetries > 10) { failStation('[合成站] 左侧盒子持续为空，原材料耗尽'); return; }
-                if (shouldLogRetry(craftStationRetries)) {
-                    console.log(`${PREFIX} [合成站] 左侧盒子为空 (重试 ${craftStationRetries}/10)`);
-                }
                 scheduleTick(3000);
                 return;
             }
             craftStationRetries = 0;
-            // 节流：仅每 20 循环输出取出日志
-            if (craftStationLogCycleCounter % 20 === 0) {
-                console.log(`${PREFIX} [合成站] 取出 ${totalWithdrawn} 个 ${craftStationInputName}`);
-            }
             craftStationState = 'CRAFT';
             scheduleTick(300);
         } catch (err) {
             craftStationRetries++;
             if (craftStationRetries > 10) { failStation(`[合成站] 开左侧盒子失败: ${err.message}`); return; }
-            if (shouldLogRetry(craftStationRetries)) {
-                console.log(`${PREFIX} [合成站] 开左侧盒子失败 (重试 ${craftStationRetries}/10): ${err.message}`);
-            }
             scheduleTick(3000);
         }
     }
@@ -2416,7 +2379,6 @@ bot.on('playerLeft', (player) => {
         craftStationAwaitingWindow = false;
 
         if (!isCraftingTableWindow(window)) {
-            console.log(`${PREFIX} [合成站] 意外窗口类型: ${window.type}，关闭并重试`);
             try { bot.closeWindow(window); } catch (e) { /* ignore */ }
             failStation('[合成站] 打开工作台时收到非合成窗口，已停止');
             return;
@@ -2469,7 +2431,6 @@ bot.on('playerLeft', (player) => {
                 await sleep(100);
             }
 
-            console.log(`${PREFIX} [合成站] 完成 ${batchesDone} 批合成，累计产出 ${craftStationTotalCrafted} 个 ${craftStationOutputName}`);
         } catch (err) {
             console.error(`${PREFIX} [合成站] 合成过程异常:`, err.message);
         }
@@ -2488,10 +2449,6 @@ bot.on('playerLeft', (player) => {
         // 先检查背包是否还有产物
         const remaining = bot.inventory.items().filter(i => i.name === craftStationOutputName);
         if (remaining.length === 0) {
-            // 无产物需存入，直接进入检查阶段（仅在汇总周期日志）
-            if (craftStationLogCycleCounter % 20 === 0) {
-                console.log(`${PREFIX} [合成站] 背包无产物，跳过存物`);
-            }
             craftStationState = 'CHECK';
             scheduleTick(200);
             return;
@@ -2504,9 +2461,6 @@ bot.on('playerLeft', (player) => {
             if (!chest || !isContainerBlock(chest.name)) {
                 craftStationRetries++;
                 if (craftStationRetries > 10) { failStation('[合成站] 右侧盒子缺失，产物盒耗尽'); return; }
-                if (shouldLogRetry(craftStationRetries)) {
-                    console.log(`${PREFIX} [合成站] 右侧盒子不存在 @ (${craftStationDestPos.x}, ${craftStationDestPos.y}, ${craftStationDestPos.z}) (重试 ${craftStationRetries}/10)`);
-                }
                 // 不清空坐标 —— 机器换盒后会放在同一位置
                 scheduleTick(3000);
                 return;
@@ -2516,9 +2470,6 @@ bot.on('playerLeft', (player) => {
             if (!chest) {
                 craftStationRetries++;
                 if (craftStationRetries > 10) { failStation('[合成站] 未找到右侧盒子，产物盒耗尽'); return; }
-                if (shouldLogRetry(craftStationRetries)) {
-                    console.log(`${PREFIX} [合成站] 未找到右侧盒子 (重试 ${craftStationRetries}/10)`);
-                }
                 scheduleTick(3000);
                 return;
             }
@@ -2530,9 +2481,6 @@ bot.on('playerLeft', (player) => {
         if (!verifyBlock || !isContainerBlock(verifyBlock.name)) {
             craftStationRetries++;
             if (craftStationRetries > 10) { failStation('[合成站] 右侧盒子在打开前被移除，产物盒耗尽'); return; }
-            if (shouldLogRetry(craftStationRetries)) {
-                console.log(`${PREFIX} [合成站] 右侧盒子在打开前消失 (重试 ${craftStationRetries}/10)`);
-            }
             scheduleTick(1500);
             return;
         }
@@ -2559,34 +2507,22 @@ bot.on('playerLeft', (player) => {
                 // 一点都没存进去 → 盒子满或不存在，等待换盒
                 craftStationRetries++;
                 if (craftStationRetries > 10) { failStation('[合成站] 右侧盒子持续无法存入，产物盒耗尽'); return; }
-                if (shouldLogRetry(craftStationRetries)) {
-                    console.log(`${PREFIX} [合成站] 右侧盒子无法存入，背包还有 ${stillRemaining.length} 组产物 (重试 ${craftStationRetries}/10)`);
-                }
                 scheduleTick(3000);
                 return;
             }
             if (stillRemaining.length > 0) {
-                // 存了一部分但盒子满了 → 继续等新盒子（首次才 log，后续静默等待）
-                if (craftStationRetries === 0) {
-                    console.log(`${PREFIX} [合成站] 存入 ${totalDeposited} 个产物，盒子满，背包剩余 ${stillRemaining.length} 组，等待新盒子...`);
-                }
+                // 存了一部分但盒子满了 → 继续等新盒子
                 scheduleTick(2000);
                 return;
             }
 
-            // 全部存完（仅在汇总周期日志）
+            // 全部存完
             craftStationRetries = 0;
-            if (craftStationLogCycleCounter % 20 === 0) {
-                console.log(`${PREFIX} [合成站] 存入 ${totalDeposited} 个 ${craftStationOutputName}（全部清空）`);
-            }
             craftStationState = 'CHECK';
             scheduleTick(200);
         } catch (err) {
             craftStationRetries++;
             if (craftStationRetries > 10) { failStation(`[合成站] 开右侧盒子失败: ${err.message}`); return; }
-            if (shouldLogRetry(craftStationRetries)) {
-                console.log(`${PREFIX} [合成站] 开右侧盒子失败 (重试 ${craftStationRetries}/10): ${err.message}`);
-            }
             scheduleTick(3000);
         }
     }
@@ -2595,15 +2531,6 @@ bot.on('playerLeft', (player) => {
 
     function phaseCheck() {
         craftStationCycleCount++;
-        craftStationLogCycleCounter++;
-
-        // 每 20 循环输出汇总，减少日志量
-        if (craftStationLogCycleCounter % 20 === 0) {
-            const durSec = craftStationStartTime > 0 ? Math.round((Date.now() - craftStationStartTime) / 1000) : 0;
-            const durStr = durSec >= 3600 ? `${Math.floor(durSec/3600)}h${Math.floor((durSec%3600)/60)}m`
-                : durSec >= 60 ? `${Math.floor(durSec/60)}m${durSec%60}s` : `${durSec}s`;
-            console.log(`${PREFIX} [合成站] 第 ${craftStationCycleCount} 循环 | 累计产出 ${craftStationTotalCrafted} 个 ${craftStationOutputName} | 运行 ${durStr}`);
-        }
 
         if (craftStationPendingStop) {
             cleanupStation(`[合成站] 已按请求停止`);
