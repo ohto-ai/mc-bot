@@ -1862,7 +1862,7 @@ bot.on('playerLeft', (player) => {
                 + 'bot_spawn = /bot spawn 用户名（启动/上线指定机器人），当玩家说"启动XX机器人""上线XX""把XX打开"等请求时使用。'
                 + 'server = /server 服务器名（通过菜单切换到指定子服，支持模糊匹配如"主服""S1""S3"），当玩家说"去XX服""切换到XX""换服""去主服/S1/S3"等请求时使用。'
                 + '使用 minechunk 时，可传入半径参数控制挖掘范围，如 minechunk(3) 挖掘3格半径内的方块。'
-                + 'attackloop = /attackloop [实体名] [范围]（持续攻击，默认攻击所有敌对生物，范围6格），当玩家说"挂机攻击""帮我清怪""刷袭击""打猪灵"等请求时使用。使用 /stop 停止。'
+                + 'attack = /attack loop [实体名] [范围] [interval 间隔tick]（持续攻击，默认攻击所有敌对生物，范围6格，interval 后跟间隔数单位为tick即1/20秒，不填则自动跟随武器冷却），当玩家说"挂机攻击""帮我清怪""刷袭击""打猪灵"等请求时使用。使用 /stop 停止。不加 loop 则为单次攻击。'
                 + '【Residence 领地传送工具】（仅可信玩家可用）：res_tp = /res tp 领地名（传送到指定领地），res_tpa = /res tpa 领地名 玩家名（请求玩家传送到某领地）。'
                 + '当玩家说"传送到XX领地""带我去XX领地""把YY传送到XX领地"等请求时使用。'
                 + '【动作姿态工具】（仅可信玩家可用，均为切换式命令——调用一次进入姿态，再次调用同一工具即可恢复站立）：'
@@ -3743,201 +3743,238 @@ bot.on('playerLeft', (player) => {
     cmd('/attack', ['/attack'],
         TRIGGER.WEB | TRIGGER.WHISPER,
         TARGET.TRUSTED,
-        '/attack [实体名] — 攻击最近实体（不填则攻击敌对生物）',
+        '/attack [loop] [实体名] [范围] [interval 间隔tick] — 攻击实体。加 loop 开启持续攻击，间隔单位为 tick（1 tick=50ms），不填则自动使用武器冷却时间。使用 /stop 停止',
         (ctx, args) => {
-            let target;
-            if (args) {
-                const targetName = args.toLowerCase();
-                target = bot.nearestEntity(e => e.name && e.name.toLowerCase().includes(targetName));
-                if (!target) { ctx.reply(`[攻击] 附近没有找到 "${args}"`); return; }
-            } else {
-                target = bot.nearestEntity(e => isHostileMob(e));
-                if (!target) { ctx.reply('[攻击] 附近没有敌对生物'); return; }
-            }
-            try {
-                bot.attack(target);
-                ctx.reply(`[攻击] 正在攻击: ${target.displayName || target.name}${target.username ? ' (' + target.username + ')' : ''}`);
-            } catch (err) {
-                ctx.reply(`[攻击] 失败: ${err.message}`);
-            }
-        }, true, {
-            entityName: { type: 'string', description: '要攻击的实体名称（可选，不填则攻击最近敌对生物）', required: false },
-        });
-
-    cmd('/attackloop', ['/attackloop'],
-        TRIGGER.WEB | TRIGGER.WHISPER,
-        TARGET.TRUSTED,
-        '/attackloop <实体名列表> [范围] — 持续攻击。多个实体名用 / 分隔，如 pillager/evoker/witch。使用 /stop 停止',
-        (ctx, args) => {
-            if (!bot.entity) { ctx.reply('[持续攻击] 机器人尚未完全加载'); return; }
-
-            // 停止已有的攻击循环
-            if (botAttackLoopInterval) {
-                clearInterval(botAttackLoopInterval);
-                botAttackLoopInterval = null;
-            }
-
             const trimmed = (args || '').trim();
-            if (!trimmed) { ctx.reply('[持续攻击] 必须指定至少一个实体名（多个用 / 分隔，如 pillager/evoker/witch）'); return; }
-
             const parts = trimmed.split(/\s+/).filter(p => p);
-            // 最后一个参数如果是纯数字则当作范围
-            const rangeStr = parts.length > 1 && /^\d+(\.\d+)?$/.test(parts[parts.length - 1])
-                ? parts.pop() : '6';
-            // 剩下的合并后用 / 拆分为多个实体名
-            const nameStr = parts.join(' ');
-            const rawNames = nameStr.split('/').map(s => s.trim().toLowerCase()).filter(s => s);
-            const scanRange = parseFloat(rangeStr) || 6;
+            const isLoop = parts.length > 0 && parts[0].toLowerCase() === 'loop';
 
-            // @e 表示攻击范围内所有非玩家实体
-            const useAtE = rawNames.includes('@e');
-            const targetNames = useAtE ? [] : rawNames;
+            if (isLoop) {
+                parts.shift(); // 移除 'loop' 关键字
 
-            botAttackingActive = true;
-            let attackCount = 0;
-            let lastReport = Date.now();
+                if (!bot.entity) { ctx.reply('[持续攻击] 机器人尚未完全加载'); return; }
 
-            ctx.reply(useAtE
-                ? `[持续攻击] 目标: @e（范围内所有非玩家实体，范围 ${scanRange}m），使用 /stop 停止`
-                : `[持续攻击] 目标: ${targetNames.join('/')}（范围 ${scanRange}m），使用 /stop 停止`);
+                // 停止已有的攻击循环
+                if (botAttackLoopInterval) {
+                    clearTimeout(botAttackLoopInterval);
+                    botAttackLoopInterval = null;
+                }
 
-            // 检查实体是否为有效攻击目标
-            const ATTACKABLE_TYPES = ['mob', 'hostile', 'player'];
+                // 解析 interval 关键字参数
+                let intervalTicks = null;
+                const intervalIdx = parts.findIndex(p => p.toLowerCase() === 'interval');
+                if (intervalIdx !== -1) {
+                    const tickStr = parts[intervalIdx + 1];
+                    if (tickStr && /^\d+(\.\d+)?$/.test(tickStr)) {
+                        intervalTicks = parseFloat(tickStr);
+                        parts.splice(intervalIdx, 2); // 移除 'interval' 及其值
+                    } else {
+                        ctx.reply('[持续攻击] interval 后需要跟数字（单位 tick），如 interval 10');
+                        return;
+                    }
+                }
 
-            function isValidTarget(entity) {
-                if (!entity || !entity.position) return false;
-                // 排除无效/非攻击实体：物品、经验球、画、船、矿车等
-                if (!entity.name) return false;
-                if (entity.name === 'item' || entity.name === 'experience_orb' ||
-                    entity.name === 'arrow' || entity.name === 'painting' ||
-                    entity.name === 'item_frame' || entity.name === 'glow_item_frame' ||
-                    entity.name === 'boat' || entity.name === 'chest_boat' ||
-                    entity.name === 'minecart' || entity.name === 'chest_minecart' ||
-                    entity.name === 'area_effect_cloud' || entity.name === 'marker') return false;
-                return true;
-            }
+                // 剩余部分：末尾数字 = 范围，前面 = 实体名
+                let scanRange = 6;
+                if (parts.length > 0 && /^\d+(\.\d+)?$/.test(parts[parts.length - 1])) {
+                    scanRange = parseFloat(parts.pop()) || 6;
+                }
 
-            function nameMatches(entity, lowerNames) {
-                if (useAtE) {
-                    // @e 模式：攻击范围内所有可攻击的实体，排除玩家和机器人自己
-                    if (entity.type === 'player' || entity.username === bot.username) return false;
-                    if (!ATTACKABLE_TYPES.includes(entity.type) && entity.type !== 'object') return false;
-                    // entity.type 'object' 中的有效目标（如 falling_block, tnt 不算）
-                    if (entity.type === 'object' && entity.name !== 'falling_block' && entity.name !== 'tnt') return false;
+                const nameStr = parts.join(' ');
+
+                // 解析目标实体名
+                let useHostileMobs = false;
+                let useAtE = false;
+                let targetNames = [];
+
+                if (!nameStr) {
+                    useHostileMobs = true;
+                } else if (nameStr === '@e') {
+                    useAtE = true;
+                } else {
+                    targetNames = nameStr.split('/').map(s => s.trim().toLowerCase()).filter(s => s);
+                    if (targetNames.length === 0) {
+                        useHostileMobs = true;
+                    }
+                }
+
+                // 将 tick 间隔转换为毫秒
+                const intervalMs = intervalTicks != null ? Math.round(intervalTicks * 50) : null;
+
+                botAttackingActive = true;
+                let attackCount = 0;
+                let lastReport = Date.now();
+
+                // 构建回复消息
+                let targetDesc;
+                if (useHostileMobs) {
+                    targetDesc = `敌对生物（范围 ${scanRange}m）`;
+                } else if (useAtE) {
+                    targetDesc = `@e（范围内所有非玩家实体，范围 ${scanRange}m）`;
+                } else {
+                    targetDesc = `${targetNames.join('/')}（范围 ${scanRange}m）`;
+                }
+                const intervalDesc = intervalTicks != null
+                    ? `，间隔 ${intervalTicks} tick (${intervalMs}ms)`
+                    : '，间隔自动（跟随武器冷却）';
+                ctx.reply(`[持续攻击] 目标: ${targetDesc}${intervalDesc}，使用 /stop 停止`);
+
+                // 检查实体是否为有效攻击目标
+                const ATTACKABLE_TYPES = ['mob', 'hostile', 'player'];
+
+                function isValidTarget(entity) {
+                    if (!entity || !entity.position) return false;
+                    if (!entity.name) return false;
+                    if (entity.name === 'item' || entity.name === 'experience_orb' ||
+                        entity.name === 'arrow' || entity.name === 'painting' ||
+                        entity.name === 'item_frame' || entity.name === 'glow_item_frame' ||
+                        entity.name === 'boat' || entity.name === 'chest_boat' ||
+                        entity.name === 'minecart' || entity.name === 'chest_minecart' ||
+                        entity.name === 'area_effect_cloud' || entity.name === 'marker') return false;
                     return true;
                 }
-                const name = (entity.name || '').toLowerCase();
-                const displayName = (typeof entity.displayName === 'string'
-                    ? entity.displayName : (entity.displayName ? JSON.stringify(entity.displayName) : '')).toLowerCase();
-                const customName = (typeof entity.customName === 'string'
-                    ? entity.customName : (entity.customName ? JSON.stringify(entity.customName) : '')).toLowerCase();
-                return lowerNames.some(kw =>
-                    name.includes(kw) || displayName.includes(kw) || customName.includes(kw)
-                );
-            }
 
-            // 从 bot.entity.attributes 读取服务端下发的实际攻击速度
-            function getAttackCooldown() {
-                try {
-                    const attr = bot.entity?.attributes?.['generic.attack_speed'];
-                    if (attr && typeof attr.value === 'number' && attr.value > 0) {
-                        return Math.ceil(1000 / attr.value); // 攻速 → 冷却毫秒
+                function nameMatches(entity, lowerNames) {
+                    if (useAtE) {
+                        if (entity.type === 'player' || entity.username === bot.username) return false;
+                        if (!ATTACKABLE_TYPES.includes(entity.type) && entity.type !== 'object') return false;
+                        if (entity.type === 'object' && entity.name !== 'falling_block' && entity.name !== 'tnt') return false;
+                        return true;
                     }
-                } catch (e) { /* fallthrough */ }
-                return 650; // 属性不可用时的安全回退
-            }
-
-            let attackCooldown = getAttackCooldown();
-            let lastAttackTime = 0;
-
-            function attackLoop() {
-                if (!botAttackingActive) {
-                    botAttackLoopInterval = null;
-                    return;
-                }
-
-                // 检查手持物品是否变化，更新冷却时间
-                const cd = getAttackCooldown();
-                if (cd !== attackCooldown) {
-                    attackCooldown = cd;
-                    console.log(`${PREFIX} [攻击] 武器切换，攻击冷却调整为 ${cd}ms`);
-                }
-
-                const pos = bot.entity.position;
-                if (!pos) {
-                    botAttackLoopInterval = setTimeout(attackLoop, 200);
-                    return;
-                }
-
-                // 在范围内查找所有匹配实体，选最近的
-                let bestTarget = null;
-                let bestDist = Infinity;
-                for (const entity of Object.values(bot.entities)) {
-                    if (!isValidTarget(entity)) continue;
-                    const dist = pos.distanceTo(entity.position);
-                    if (dist > scanRange) continue;
-                    if (dist >= bestDist) continue;
-                    if (nameMatches(entity, targetNames)) {
-                        bestDist = dist;
-                        bestTarget = entity;
+                    if (useHostileMobs) {
+                        return isHostileMob(entity);
                     }
+                    const name = (entity.name || '').toLowerCase();
+                    const displayName = (typeof entity.displayName === 'string'
+                        ? entity.displayName : (entity.displayName ? JSON.stringify(entity.displayName) : '')).toLowerCase();
+                    const customName = (typeof entity.customName === 'string'
+                        ? entity.customName : (entity.customName ? JSON.stringify(entity.customName) : '')).toLowerCase();
+                    return lowerNames.some(kw =>
+                        name.includes(kw) || displayName.includes(kw) || customName.includes(kw)
+                    );
                 }
 
-                if (!bestTarget) {
-                    // 无目标，快速扫描
-                    botAttackLoopInterval = setTimeout(attackLoop, 200);
-                    return;
+                // 从 bot.entity.attributes 读取服务端下发的实际攻击速度
+                function getAttackCooldown() {
+                    try {
+                        const attr = bot.entity?.attributes?.['generic.attack_speed'];
+                        if (attr && typeof attr.value === 'number' && attr.value > 0) {
+                            return Math.ceil(1000 / attr.value);
+                        }
+                    } catch (e) { /* fallthrough */ }
+                    return 650;
                 }
 
-                // 检查冷却是否就绪
-                const now = Date.now();
-                const elapsed = now - lastAttackTime;
-                if (elapsed < attackCooldown) {
-                    // 冷却中，看目标但不攻击
-                    botAttackLoopInterval = setTimeout(attackLoop, Math.max(50, attackCooldown - elapsed));
-                    return;
-                }
+                let attackCooldown = getAttackCooldown();
+                let lastAttackTime = 0;
 
-                // 再次验证目标仍然存在且有效（防止攻击已消失的实体）
-                try {
-                    const refreshed = bot.entities[bestTarget.id || bestTarget.uuid];
-                    if (!refreshed || !refreshed.position) {
+                function attackLoop() {
+                    if (!botAttackingActive) {
+                        botAttackLoopInterval = null;
+                        return;
+                    }
+
+                    // 检查手持物品是否变化，更新冷却时间（仅在未手动设置间隔时）
+                    if (intervalMs == null) {
+                        const cd = getAttackCooldown();
+                        if (cd !== attackCooldown) {
+                            attackCooldown = cd;
+                            console.log(`${PREFIX} [攻击] 武器切换，攻击冷却调整为 ${cd}ms`);
+                        }
+                    }
+
+                    const pos = bot.entity.position;
+                    if (!pos) {
                         botAttackLoopInterval = setTimeout(attackLoop, 200);
                         return;
                     }
-                } catch (e) {
-                    botAttackLoopInterval = setTimeout(attackLoop, 200);
-                    return;
-                }
 
-                try {
-                    // 看向目标并攻击
-                    bot.lookAt(bestTarget.position.offset(0, bestTarget.height ? bestTarget.height * 0.5 : 1, 0), true);
-                    bot.attack(bestTarget);
-                    lastAttackTime = Date.now();
-                    attackCount++;
-
-                    // 每 30 秒或每 50 次攻击汇报一次
-                    if (Date.now() - lastReport > 30000 || attackCount % 50 === 0) {
-                        const targetName = bestTarget.displayName || bestTarget.name || '(未知)';
-                        if (ctx.type === 'whisper') {
-                            safeWhisper(ctx.sender, `[持续攻击进度] 已攻击 ${attackCount} 次，当前目标: ${targetName}`);
+                    // 在范围内查找所有匹配实体，选最近的
+                    let bestTarget = null;
+                    let bestDist = Infinity;
+                    for (const entity of Object.values(bot.entities)) {
+                        if (!isValidTarget(entity)) continue;
+                        const dist = pos.distanceTo(entity.position);
+                        if (dist > scanRange) continue;
+                        if (dist >= bestDist) continue;
+                        if (nameMatches(entity, targetNames)) {
+                            bestDist = dist;
+                            bestTarget = entity;
                         }
-                        lastReport = Date.now();
                     }
-                } catch (err) {
-                    // 攻击失败静默跳过
+
+                    if (!bestTarget) {
+                        botAttackLoopInterval = setTimeout(attackLoop, 200);
+                        return;
+                    }
+
+                    // 检查冷却/间隔是否就绪
+                    const now = Date.now();
+                    const elapsed = now - lastAttackTime;
+                    const effectiveCooldown = intervalMs != null ? intervalMs : attackCooldown;
+                    if (elapsed < effectiveCooldown) {
+                        botAttackLoopInterval = setTimeout(attackLoop, Math.max(50, effectiveCooldown - elapsed));
+                        return;
+                    }
+
+                    // 再次验证目标仍然存在且有效
+                    try {
+                        const refreshed = bot.entities[bestTarget.id || bestTarget.uuid];
+                        if (!refreshed || !refreshed.position) {
+                            botAttackLoopInterval = setTimeout(attackLoop, 200);
+                            return;
+                        }
+                    } catch (e) {
+                        botAttackLoopInterval = setTimeout(attackLoop, 200);
+                        return;
+                    }
+
+                    try {
+                        bot.lookAt(bestTarget.position.offset(0, bestTarget.height ? bestTarget.height * 0.5 : 1, 0), true);
+                        bot.attack(bestTarget);
+                        lastAttackTime = Date.now();
+                        attackCount++;
+
+                        // 每 30 秒或每 50 次攻击汇报一次
+                        if (Date.now() - lastReport > 30000 || attackCount % 50 === 0) {
+                            const targetName = bestTarget.displayName || bestTarget.name || '(未知)';
+                            if (ctx.type === 'whisper') {
+                                safeWhisper(ctx.sender, `[持续攻击进度] 已攻击 ${attackCount} 次，当前目标: ${targetName}`);
+                            }
+                            lastReport = Date.now();
+                        }
+                    } catch (err) {
+                        // 攻击失败静默跳过
+                    }
+
+                    // 按间隔调度下一次攻击
+                    const nextCooldown = intervalMs != null ? intervalMs : attackCooldown;
+                    botAttackLoopInterval = setTimeout(attackLoop, Math.max(50, nextCooldown - (Date.now() - lastAttackTime)));
                 }
 
-                // 按冷却时间调度下一次攻击
-                botAttackLoopInterval = setTimeout(attackLoop, Math.max(50, attackCooldown - (Date.now() - lastAttackTime)));
-            }
+                // 启动攻击循环
+                botAttackLoopInterval = setTimeout(attackLoop, 100);
 
-            // 启动攻击循环
-            botAttackLoopInterval = setTimeout(attackLoop, 100);
+            } else {
+                // 单次攻击模式（原逻辑）
+                let target;
+                if (args) {
+                    const targetName = args.toLowerCase();
+                    target = bot.nearestEntity(e => e.name && e.name.toLowerCase().includes(targetName));
+                    if (!target) { ctx.reply(`[攻击] 附近没有找到 "${args}"`); return; }
+                } else {
+                    target = bot.nearestEntity(e => isHostileMob(e));
+                    if (!target) { ctx.reply('[攻击] 附近没有敌对生物'); return; }
+                }
+                try {
+                    bot.attack(target);
+                    ctx.reply(`[攻击] 正在攻击: ${target.displayName || target.name}${target.username ? ' (' + target.username + ')' : ''}`);
+                } catch (err) {
+                    ctx.reply(`[攻击] 失败: ${err.message}`);
+                }
+            }
         }, true, {
-            names: { type: 'string', description: '要攻击的实体名列表，多个用 / 分隔，如 pillager/evoker/vindicator/witch/ravager/vex', required: true },
-            range: { type: 'number', description: '扫描范围（可选，默认6格）', minimum: 1, maximum: 30, required: false },
+            entityName: { type: 'string', description: 'loop [实体名列表] [范围] [间隔tick]。实体名用 / 分隔。加 loop 为持续攻击，间隔单位 tick（1 tick=50ms），不填则自动跟随武器冷却', required: false },
         });
 
     // ---- 物品使用 ----
@@ -4007,7 +4044,7 @@ bot.on('playerLeft', (player) => {
             // 停止持续攻击
             botAttackingActive = false;
             if (botAttackLoopInterval) {
-                clearInterval(botAttackLoopInterval);
+                clearTimeout(botAttackLoopInterval);
                 botAttackLoopInterval = null;
             }
             // 停止合成站
