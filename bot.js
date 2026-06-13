@@ -182,7 +182,7 @@ function createBotInstance(config, options = {}) {
 
     // ---- 调试日志：监听所有关键事件 ----
     const events = [
-        'whisper', 'windowOpen',
+        'whisper',
         'login', 'connect', 'end', 'error', 'kicked',
         'death', 'respawn',
         'rain',
@@ -1028,8 +1028,6 @@ function createBotInstance(config, options = {}) {
 
     // ========== 菜单窗口自动化 ==========
     bot.on('windowOpen', (window) => {
-        console.log(`${PREFIX} [菜单] 窗口打开 [类型=${window.type}, 槽位数=${window.slots.length}]`);
-
         // 合成站窗口分流：CRAFT 阶段等待工作台窗口
         if (craftStationActive && craftStationAwaitingWindow && craftStationState === 'CRAFT') {
             handleCraftingWindow(window);
