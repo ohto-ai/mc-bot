@@ -3574,15 +3574,15 @@ bot.on('playerLeft', (player) => {
     // ---- 公共命令（所有人可用） ----
 
     cmd('/ping', ['/ping', 'ping'],
-        TRIGGER.WEB | TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.ALL,
-        '/ping — 测试机器人是否在线',
+        '/ping — 测试机器人是否在线（仅支持 @ / >> / 私聊）',
         (ctx) => { ctx.reply('pong!'); }, true);
 
     cmd('/v50', ['/v50', 'v50'],
-        TRIGGER.WEB | TRIGGER.CHAT | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
+        TRIGGER.WEB | TRIGGER.WHISPER | TRIGGER.MENTION | TRIGGER.REPLY | TRIGGER.QQ_AT,
         TARGET.ALL,
-        '/v50 — 疯狂星期四文案',
+        '/v50 — 疯狂星期四文案（仅支持 @ / >> / 私聊）',
         async (ctx) => {
             try {
                 const res = await fetch('https://api.shadiao.pro/kfc');
