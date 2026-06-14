@@ -5423,6 +5423,9 @@ bot.on('playerLeft', (player) => {
         const mentionPrefixes = [`>>${bot.username}`, `@${bot.username}`];
         for (const prefix of mentionPrefixes) {
             if (message.startsWith(prefix)) {
+                // 确保机器人名是完整单词匹配，防止 fox 误匹配 foxy
+                const nextChar = message[prefix.length];
+                if (nextChar !== undefined && nextChar !== ' ') continue;
                 const content = message.slice(prefix.length).trim();
                 if (!content) return;
                 const triggerFlag = prefix.startsWith('>>') ? TRIGGER.REPLY : TRIGGER.MENTION;
